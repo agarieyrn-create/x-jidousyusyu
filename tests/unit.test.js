@@ -131,21 +131,33 @@ test('validateIdeasOutput: rejects when ideas is not array', () => {
   const r = validateIdeasOutput({ ideas: 'oops' });
   assert.equal(r.ok, false);
 });
+test('validateIdeasOutput: rejects when ideas.length < 3', () => {
+  const idea = {
+    title: 't', objective: 'o', target: 'x', hook: 'h', angle: 'a',
+    structure: ['s'], key_points: ['k'], personal_experience_needed: ['exp'], reference_patterns: ['p']
+  };
+  const r1 = validateIdeasOutput({ ideas: [idea] });
+  assert.equal(r1.ok, false, '1件は不足');
+  const r2 = validateIdeasOutput({ ideas: [idea, idea] });
+  assert.equal(r2.ok, false, '2件は不足');
+});
 test('validateIdeasOutput: rejects when personal_experience_needed missing', () => {
-  const r = validateIdeasOutput({
-    ideas: [{ title: 't', hook: 'h', angle: 'a', structure: ['s'], key_points: ['k'], reference_patterns: [] }]
-  });
+  const bad = { title: 't', hook: 'h', angle: 'a', structure: ['s'], key_points: ['k'], reference_patterns: [] };
+  const good = {
+    title: 't', objective: 'o', target: 'x', hook: 'h', angle: 'a',
+    structure: ['s'], key_points: ['k'], personal_experience_needed: ['exp'], reference_patterns: ['p']
+  };
+  const r = validateIdeasOutput({ ideas: [bad, good, good] });
   assert.equal(r.ok, false);
 });
-test('validateIdeasOutput: accepts valid payload', () => {
-  const r = validateIdeasOutput({
-    ideas: [{
-      title: 't', objective: 'o', target: 'x', hook: 'h', angle: 'a',
-      structure: ['s'], key_points: ['k'], personal_experience_needed: ['exp'], reference_patterns: ['p']
-    }]
-  });
+test('validateIdeasOutput: accepts >=3 valid ideas', () => {
+  const idea = {
+    title: 't', objective: 'o', target: 'x', hook: 'h', angle: 'a',
+    structure: ['s'], key_points: ['k'], personal_experience_needed: ['exp'], reference_patterns: ['p']
+  };
+  const r = validateIdeasOutput({ ideas: [idea, idea, idea] });
   assert.equal(r.ok, true);
-  assert.equal(r.value.ideas.length, 1);
+  assert.equal(r.value.ideas.length, 3);
 });
 
 // ---------- MockAIProvider ----------

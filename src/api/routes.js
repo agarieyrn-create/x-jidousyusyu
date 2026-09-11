@@ -236,8 +236,20 @@ export function createApiRoutes({ getWorkspaceId }) {
       });
     }
 
-    // Live: 重複排除 + DB挿入 + score
+    // Live: 重複排除 + score
     status.push(`${results.length}件取得しました`);
+    // 期間フィルタ (X APIの取得結果もdays指定に合わせて古い投稿を除外する)
+    if (Number(days) > 0) {
+      const cutoffMs = Date.now() - Number(days) * 86400000;
+      const before = results.length;
+      for (let i = results.length - 1; i >= 0; i--) {
+        const t = results[i].published_at ? new Date(results[i].published_at).getTime() : NaN;
+        if (!Number.isFinite(t) || t < cutoffMs) results.splice(i, 1);
+      }
+      if (before !== results.length) {
+        status.push(`期間外(${days}日より古い) ${before - results.length}件を除外しました`);
+      }
+    }
     const dedup = [];
     const seen = new Set();
     for (const p of results) {
@@ -248,28 +260,7 @@ export function createApiRoutes({ getWorkspaceId }) {
     }
     status.push(`重複${duplicates}件を除外しました`);
     const scored = computeTrendScoreBatch(dedup);
-    const insertStmt = db.prepare(`INSERT OR IGNORE INTO research_posts
-      (id, workspace_id, platform, external_post_id, author_id, username, display_name,
-       text, url, published_at, like_count, repost_count, reply_count, quote_count, follower_count,
-       trend_score, source_keyword, is_saved, has_media, created_at, updated_at)
-      VALUES (@id, @workspace_id, @platform, @external_post_id, @author_id, @username, @display_name,
-              @text, @url, @published_at, @like_count, @repost_count, @reply_count, @quote_count, @follower_count,
-              @trend_score, @source_keyword, 0, @has_media, @created_at, @updated_at)`);
-    const now = nowIso();
-    for (const p of scored) {
-      insertStmt.run({
-        id: uid('pst'),
-        workspace_id: wid, platform: 'x',
-        external_post_id: p.external_post_id,
-        author_id: p.author_id, username: p.username, display_name: p.display_name,
-        text: p.text, url: p.url, published_at: p.published_at,
-        like_count: p.like_count, repost_count: p.repost_count, reply_count: p.reply_count,
-        quote_count: p.quote_count, follower_count: p.follower_count ?? 0,
-        trend_score: p.trend_score, source_keyword: p.source_keyword,
-        has_media: p.has_media ? 1 : 0,
-        created_at: now, updated_at: now
-      });
-    }
+    upsertPostsBatch({ workspaceId: wid, posts: scored });
     status.push('Trend Scoreを計算しました');
     const savedRows = db.prepare(`SELECT * FROM research_posts WHERE workspace_id = ? AND external_post_id IN (${dedup.map(() => '?').join(',') || "''"})`)
       .all(wid, ...dedup.map(p => p.external_post_id));
@@ -689,4 +680,102 @@ function countBy(arr) {
   const m = {};
   for (const v of arr) m[v] = (m[v] || 0) + 1;
   return Object.entries(m).map(([k, v]) => ({ key: k, count: v })).sort((a, b) => b.count - a.count);
+}
+
+/**
+ * research_posts への UPSERT。
+ *
+ * 既存行 (workspace_id + platform + external_post_id で一致) は
+ *   text / username / display_name / like_count / repost_count / reply_count / quote_count
+ *   follower_count / trend_score / has_media / source_keyword / updated_at
+ * を最新値へ更新する。
+ *
+ * id / is_saved / created_at は保持する (ユーザーが保存済みマークしていても消えないため)。
+ * workspace_id はキーの一部なので当然変わらない。
+ *
+ * 同一 platform+external_post_id が「別ワークスペース」にも存在する場合、
+ * 現在のスキーマは UNIQUE(platform, external_post_id) 制約があるため
+ * ワークスペースを跨いで重複を持たない前提。安全のため WHERE に workspace_id も含める。
+ */
+export function upsertPostsBatch({ workspaceId, posts }) {
+  const now = nowIso();
+  const findStmt = db.prepare(
+    'SELECT id FROM research_posts WHERE workspace_id = ? AND platform = ? AND external_post_id = ?'
+  );
+  const insertStmt = db.prepare(`INSERT INTO research_posts
+    (id, workspace_id, platform, external_post_id, author_id, username, display_name,
+     text, url, published_at, like_count, repost_count, reply_count, quote_count, follower_count,
+     trend_score, source_keyword, is_saved, has_media, created_at, updated_at)
+    VALUES (@id, @workspace_id, @platform, @external_post_id, @author_id, @username, @display_name,
+            @text, @url, @published_at, @like_count, @repost_count, @reply_count, @quote_count, @follower_count,
+            @trend_score, @source_keyword, 0, @has_media, @created_at, @updated_at)`);
+  const updateStmt = db.prepare(`UPDATE research_posts SET
+      text = @text,
+      username = @username,
+      display_name = @display_name,
+      like_count = @like_count,
+      repost_count = @repost_count,
+      reply_count = @reply_count,
+      quote_count = @quote_count,
+      follower_count = @follower_count,
+      trend_score = @trend_score,
+      has_media = @has_media,
+      source_keyword = @source_keyword,
+      updated_at = @updated_at
+    WHERE workspace_id = @workspace_id AND platform = @platform AND external_post_id = @external_post_id`);
+
+  const results = [];
+  const tx = db.transaction(list => {
+    for (const p of list) {
+      const platform = p.platform || 'x';
+      const existing = findStmt.get(workspaceId, platform, p.external_post_id);
+      if (existing) {
+        updateStmt.run({
+          workspace_id: workspaceId,
+          platform,
+          external_post_id: p.external_post_id,
+          text: p.text ?? '',
+          username: p.username ?? null,
+          display_name: p.display_name ?? null,
+          like_count: p.like_count || 0,
+          repost_count: p.repost_count || 0,
+          reply_count: p.reply_count || 0,
+          quote_count: p.quote_count || 0,
+          follower_count: p.follower_count ?? 0,
+          trend_score: p.trend_score || 0,
+          has_media: p.has_media ? 1 : 0,
+          source_keyword: p.source_keyword ?? null,
+          updated_at: now
+        });
+        results.push({ id: existing.id, mode: 'updated' });
+      } else {
+        const id = uid('pst');
+        insertStmt.run({
+          id,
+          workspace_id: workspaceId,
+          platform,
+          external_post_id: p.external_post_id,
+          author_id: p.author_id || null,
+          username: p.username || null,
+          display_name: p.display_name || null,
+          text: p.text ?? '',
+          url: p.url || null,
+          published_at: p.published_at || null,
+          like_count: p.like_count || 0,
+          repost_count: p.repost_count || 0,
+          reply_count: p.reply_count || 0,
+          quote_count: p.quote_count || 0,
+          follower_count: p.follower_count ?? 0,
+          trend_score: p.trend_score || 0,
+          source_keyword: p.source_keyword ?? null,
+          has_media: p.has_media ? 1 : 0,
+          created_at: now,
+          updated_at: now
+        });
+        results.push({ id, mode: 'inserted' });
+      }
+    }
+  });
+  tx(posts);
+  return results;
 }

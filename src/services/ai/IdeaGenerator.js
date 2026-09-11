@@ -1,9 +1,16 @@
 // IdeaGenerator: 投稿+分析+ユーザープロフィールから「自分向けアイデア3案」を生成
-// コピー防止ルールを必ずプロンプトに含める。
-// validate 失敗時は1度だけ再生成。それでもダメなら空を返す (呼び出し側はDBに保存しない)。
+//
+// 契約 (2回目の修正 2026-09-11):
+//  - 最終返却の ideas は必ず3件以上 (IDEAS_MIN_COUNT)。
+//  - 元投稿とのコピー類似度が閾値 (COPY_SIM_THRESHOLD) 以上の案は必ず不採用。
+//    「全部NGなら fallback で復活させる」動作は禁止する。
+//  - 類似度フィルタ後に3件に満たなければ、1度だけ追加再生成して補完する。
+//  - それでも3件揃わなければ ideas:[] で返し、呼び出し側は DB 保存せず 500 応答。
 
 import { createAIProvider, safeParseJson } from './AIProvider.js';
-import { validateIdeasOutput } from './validators.js';
+import { validateIdeasOutput, IDEAS_MIN_COUNT } from './validators.js';
+
+const COPY_SIM_THRESHOLD = 0.55;
 
 function similarity(a, b) {
   // 単純な文字bigram Jaccard
@@ -14,7 +21,16 @@ function similarity(a, b) {
   return inter / union;
 }
 
-function buildPrompt({ post, analysis, profile, schemaHint }) {
+function isTooSimilar(idea, postText) {
+  const combined = `${idea.title || ''} ${idea.hook || ''} ${idea.angle || ''}`;
+  return similarity(combined, postText) >= COPY_SIM_THRESHOLD;
+}
+
+function ideaFingerprint(idea) {
+  return `${(idea.title || '').trim()}|${(idea.hook || '').trim()}`;
+}
+
+function buildPrompt({ post, analysis, profile, schemaHint, extraNote }) {
   return `# IDEA_GENERATION
 あなたはSNSコンテンツ設計の伴走者です。目的は「元投稿のコピー」ではなく、
 "成功パターンを抽象化し、ユーザーのジャンル向けに変換した新規アイデア"を作ることです。
@@ -41,8 +57,22 @@ target: ${profile?.target_audience || ''}
 objectives: ${(profile?.objectives || []).join(', ')}
 writing_style: ${profile?.writing_style || ''}
 excluded_topics: ${(profile?.excluded_topics || []).join(', ')}
+${extraNote ? '\n' + extraNote + '\n' : ''}
+必ず${IDEAS_MIN_COUNT}案以上。JSONのみで返してください。スキーマ: ${JSON.stringify(schemaHint)}`;
+}
 
-必ず3案。JSONのみで返してください。スキーマ: ${JSON.stringify(schemaHint)}`;
+async function requestIdeas(provider, prompt, schemaHint) {
+  let raw = null;
+  try {
+    raw = await provider.generateStructuredOutput(prompt, schemaHint);
+  } catch { raw = null; }
+  if (!raw) {
+    try {
+      const textOut = await provider.generateText(prompt);
+      raw = safeParseJson(textOut);
+    } catch { raw = null; }
+  }
+  return raw;
 }
 
 export async function generateIdeas({ post, analysis, profile }) {
@@ -53,38 +83,57 @@ export async function generateIdeas({ post, analysis, profile }) {
       structure: 'string[]', key_points: 'string[]', personal_experience_needed: 'string[]', reference_patterns: 'string[]'
     }]
   };
-  const prompt = buildPrompt({ post, analysis, profile, schemaHint });
 
-  // --- try 1 ---
-  let raw = null;
-  try {
-    raw = await provider.generateStructuredOutput(prompt, schemaHint);
-  } catch { raw = null; }
-  let validated = validateIdeasOutput(raw);
+  // --- 1回目: 通常生成 ---
+  const prompt1 = buildPrompt({ post, analysis, profile, schemaHint });
+  const raw1 = await requestIdeas(provider, prompt1, schemaHint);
+  const validated1 = validateIdeasOutput(raw1);
 
-  if (!validated.ok) {
-    // --- try 2 (1度だけ再生成) ---
-    const retryPrompt = prompt + '\n\n※前回の出力はスキーマに合いませんでした。必ず有効なJSONのみを返してください。ideas は必ず配列で、各要素の personal_experience_needed は必ず埋めてください。';
-    let raw2 = null;
-    try {
-      raw2 = await provider.generateStructuredOutput(retryPrompt, schemaHint);
-      if (!raw2) {
-        const textOut = await provider.generateText(retryPrompt);
-        raw2 = safeParseJson(textOut);
+  let acceptedIdeas = [];
+  let seen = new Set();
+  if (validated1.ok) {
+    for (const idea of validated1.value.ideas) {
+      if (isTooSimilar(idea, post.text)) continue;   // コピー類似度NG → 必ず不採用 (fallback復活しない)
+      const fp = ideaFingerprint(idea);
+      if (seen.has(fp)) continue;
+      seen.add(fp);
+      acceptedIdeas.push(idea);
+    }
+  }
+
+  // --- 3件に満たなければ 1度だけ追加再生成 ---
+  if (acceptedIdeas.length < IDEAS_MIN_COUNT) {
+    const need = IDEAS_MIN_COUNT - acceptedIdeas.length;
+    const extraNote = `※前回の出力は使えませんでした。以下のいずれかに該当した可能性があります:
+- スキーマに合っていない
+- 元投稿と表現が近すぎる (bigram類似度 >= ${COPY_SIM_THRESHOLD})
+- ${IDEAS_MIN_COUNT}案未満だった
+必ず${IDEAS_MIN_COUNT}案以上、"元投稿とは異なる表現・切り口"で返してください。
+以下の hook はすでに採用済みなので絶対に重複させないでください:
+${acceptedIdeas.map((i, k) => `${k + 1}. ${i.hook}`).join('\n') || '(なし)'}
+今回は特に、これらとは異なる ${need} 案以上を出してください。`;
+    const prompt2 = buildPrompt({ post, analysis, profile, schemaHint, extraNote });
+    const raw2 = await requestIdeas(provider, prompt2, schemaHint);
+    const validated2 = validateIdeasOutput(raw2);
+    if (validated2.ok) {
+      for (const idea of validated2.value.ideas) {
+        if (isTooSimilar(idea, post.text)) continue;
+        const fp = ideaFingerprint(idea);
+        if (seen.has(fp)) continue;
+        seen.add(fp);
+        acceptedIdeas.push(idea);
+        if (acceptedIdeas.length >= IDEAS_MIN_COUNT) break;
       }
-    } catch { raw2 = null; }
-    validated = validateIdeasOutput(raw2);
+    }
   }
 
-  if (!validated.ok) {
-    return { ideas: [], error: 'AI生成に失敗しました', validation_errors: validated.errors };
+  if (acceptedIdeas.length < IDEAS_MIN_COUNT) {
+    // 3案に満たなければ「中途半端に保存させない」。呼び出し側は500応答へ。
+    return {
+      ideas: [],
+      error: `アイデア生成に失敗しました (${IDEAS_MIN_COUNT}案を確保できず、${acceptedIdeas.length}案に留まりました)`
+    };
   }
 
-  // コピー防止フィルタ: 元投稿と類似度が高すぎるものを弾く
-  const filtered = validated.value.ideas.filter(idea => {
-    const combined = `${idea.title} ${idea.hook} ${idea.angle}`;
-    return similarity(combined, post.text) < 0.55;
-  });
-
-  return { ideas: filtered.length >= 1 ? filtered : validated.value.ideas };
+  return { ideas: acceptedIdeas.slice(0, Math.max(IDEAS_MIN_COUNT, acceptedIdeas.length)) };
 }

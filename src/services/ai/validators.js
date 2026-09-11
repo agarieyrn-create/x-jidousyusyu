@@ -57,15 +57,19 @@ export function validateAnalysisOutput(raw) {
 
 /**
  * IdeaGenerator.js が返すアイデア群JSONを検証する。
- * ideas は必須 array、各要素の必須フィールド型もチェックする。
+ * ideas は必須 array、length >= 3、各要素の必須フィールド型もチェックする。
  * @returns {{ok:boolean, value?:{ideas:Array<object>}, errors?:string[]}}
  */
+export const IDEAS_MIN_COUNT = 3;
+
 export function validateIdeasOutput(raw) {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
     return { ok: false, errors: ['ideas payload is not an object'] };
   }
   if (!Array.isArray(raw.ideas)) return { ok: false, errors: ['ideas must be an array'] };
-  if (raw.ideas.length === 0) return { ok: false, errors: ['ideas must not be empty'] };
+  if (raw.ideas.length < IDEAS_MIN_COUNT) {
+    return { ok: false, errors: [`ideas must have at least ${IDEAS_MIN_COUNT} items (got ${raw.ideas.length})`] };
+  }
 
   const stringFields = ['title', 'objective', 'target', 'hook', 'angle'];
   const arrayFields = ['structure', 'key_points', 'personal_experience_needed', 'reference_patterns'];
