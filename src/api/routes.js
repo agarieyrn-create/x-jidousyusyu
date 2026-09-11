@@ -1,8 +1,14 @@
 // API routes (Hono). UIコンポーネントから直接DBを触らずここに集約。
+//
+// セキュリティ原則:
+//   - 全ID指定APIは必ず WHERE id = ? AND workspace_id = ? で所有権確認する。
+//   - analyses は workspace_id を直接持たないので research_posts JOIN で確認する。
+//   - 所有権NG → 404 (存在自体を伏せる) を返す。
 import { Hono } from 'hono';
 import { db, jsonArray, toJson, nowIso, uid } from '../db/index.js';
 import { computeTrendScoreBatch } from '../services/scoring/TrendScore.js';
 import { XAdapter } from '../services/social/x/XAdapter.js';
+import { applyEngagementFilter } from '../services/social/x/XQueryBuilder.js';
 import { ManualAdapter } from '../services/social/manual/ManualAdapter.js';
 import { generateKeywords } from '../services/ai/KeywordGenerator.js';
 import { analyzePost } from '../services/ai/Analyzer.js';
@@ -13,6 +19,15 @@ import { parseXUrl } from '../services/social/x/XUrlParser.js';
 
 export function createApiRoutes({ getWorkspaceId }) {
   const api = new Hono();
+
+  // ---------- 所有権 helper ----------
+  // それぞれ「id と workspace_id が一致した行」だけを返す。
+  // 一致しなければ undefined を返す (=呼び出し側で 404)。
+  function findKeywordOwned(id, wid)      { return db.prepare('SELECT * FROM research_keywords WHERE id = ? AND workspace_id = ?').get(id, wid); }
+  function findPostOwned(id, wid)         { return db.prepare('SELECT * FROM research_posts WHERE id = ? AND workspace_id = ?').get(id, wid); }
+  function findWatchOwned(id, wid)        { return db.prepare('SELECT * FROM watch_accounts WHERE id = ? AND workspace_id = ?').get(id, wid); }
+  function findIdeaOwned(id, wid)         { return db.prepare('SELECT * FROM ideas WHERE id = ? AND workspace_id = ?').get(id, wid); }
+  // analyses は post_id 経由でしか辿らないため、post 所有権と一体で使う。
 
   // ---------- health / status ----------
   api.get('/status', c => {
@@ -94,7 +109,6 @@ export function createApiRoutes({ getWorkspaceId }) {
         subTopics: jsonArray(profile?.sub_topics),
         targetAudience: profile?.target_audience
       });
-      // 既存の "ai" ソースを残しつつ提案候補として返す (自動確定しない)
       return c.json({ suggestions: gen.keywords, source: gen.source });
     }
     const now = nowIso();
@@ -107,28 +121,33 @@ export function createApiRoutes({ getWorkspaceId }) {
         db.prepare('INSERT INTO research_keywords (id, workspace_id, keyword, is_active, source, created_at) VALUES (?, ?, ?, 1, ?, ?)')
           .run(id, wid, k, body.source || 'user', now);
         inserted.push({ id, keyword: k });
-      } catch (e) {
-        // ignore duplicate
-      }
+      } catch (e) { /* ignore duplicate */ }
     }
     return c.json({ ok: true, inserted });
   });
 
   api.put('/keywords/:id', async c => {
+    const wid = getWorkspaceId(c);
     const id = c.req.param('id');
+    const target = findKeywordOwned(id, wid);
+    if (!target) return c.json({ error: 'not_found' }, 404);
+
     const body = await c.req.json();
     const fields = [];
     const vals = [];
     if (body.keyword !== undefined) { fields.push('keyword = ?'); vals.push(body.keyword); }
     if (body.is_active !== undefined) { fields.push('is_active = ?'); vals.push(body.is_active ? 1 : 0); }
     if (fields.length === 0) return c.json({ ok: true });
-    vals.push(id);
-    db.prepare(`UPDATE research_keywords SET ${fields.join(', ')} WHERE id = ?`).run(...vals);
+    vals.push(id, wid);
+    db.prepare(`UPDATE research_keywords SET ${fields.join(', ')} WHERE id = ? AND workspace_id = ?`).run(...vals);
     return c.json({ ok: true });
   });
 
   api.delete('/keywords/:id', c => {
-    db.prepare('DELETE FROM research_keywords WHERE id = ?').run(c.req.param('id'));
+    const wid = getWorkspaceId(c);
+    const id = c.req.param('id');
+    const info = db.prepare('DELETE FROM research_keywords WHERE id = ? AND workspace_id = ?').run(id, wid);
+    if (info.changes === 0) return c.json({ error: 'not_found' }, 404);
     return c.json({ ok: true });
   });
 
@@ -153,17 +172,38 @@ export function createApiRoutes({ getWorkspaceId }) {
 
     if (x.isConfigured() && keywordList.length > 0) {
       status.push(`Xから投稿を取得しています (${keywordList.length}キーワード)`);
+      let sawFatalError = null;
       for (const kw of keywordList.slice(0, 5)) {
         const r = await x.search({
-          keyword: kw, language, minLikes, minReposts,
+          keyword: kw, language,
+          minLikes, minReposts,   // XAdapterが取得後にpost-filterを行う
           excludeKeywords, fromUsername,
           excludeReposts, excludeReplies, perKeyword: 20
         });
-        if (r.mode === 'error') status.push(`X APIエラー: ${r.error}`);
+        if (r.mode === 'error') {
+          // ユーザー向けメッセージのみ格納。Bearer Token等の機密情報は含まない。
+          status.push(`X APIエラー: ${r.error}`);
+          if (r.error_code === 'rate_limited' || r.error_code === 'unauthorized' || r.error_code === 'forbidden') {
+            sawFatalError = r;
+            break; // 続けても同じエラーになるので早期打ち切り
+          }
+          continue;
+        }
         for (const p of r.posts) {
           results.push({ ...p, source_keyword: kw });
           live++;
         }
+      }
+      if (sawFatalError && results.length === 0) {
+        // 実データが1件も無くエラーで終わったケース: 明示的にエラー応答を返す
+        return c.json({
+          mode: 'error',
+          status,
+          error: sawFatalError.error,
+          error_code: sawFatalError.error_code,
+          posts: [],
+          stats: { live: 0, demo: 0, duplicates: 0 }
+        }, sawFatalError.error_code === 'rate_limited' ? 429 : 502);
       }
     } else {
       status.push('DEMO MODE: 保存済みモックデータからフィルタします');
@@ -184,9 +224,8 @@ export function createApiRoutes({ getWorkspaceId }) {
       }
       demoUsed = filtered.length;
       const scored = computeTrendScoreBatch(filtered);
-      // scoreをDBにも更新しておく
-      const upd = db.prepare('UPDATE research_posts SET trend_score = ? WHERE id = ?');
-      for (const p of scored) upd.run(p.trend_score, p.id);
+      const upd = db.prepare('UPDATE research_posts SET trend_score = ? WHERE id = ? AND workspace_id = ?');
+      for (const p of scored) upd.run(p.trend_score, p.id, wid);
       status.push(`${demoUsed}件取得しました`);
       status.push('Trend Scoreを計算しました');
       return c.json({
@@ -225,7 +264,7 @@ export function createApiRoutes({ getWorkspaceId }) {
         author_id: p.author_id, username: p.username, display_name: p.display_name,
         text: p.text, url: p.url, published_at: p.published_at,
         like_count: p.like_count, repost_count: p.repost_count, reply_count: p.reply_count,
-        quote_count: p.quote_count, follower_count: p.follower_count,
+        quote_count: p.quote_count, follower_count: p.follower_count ?? 0,
         trend_score: p.trend_score, source_keyword: p.source_keyword,
         has_media: p.has_media ? 1 : 0,
         created_at: now, updated_at: now
@@ -257,8 +296,9 @@ export function createApiRoutes({ getWorkspaceId }) {
   });
 
   api.get('/posts/:id', c => {
+    const wid = getWorkspaceId(c);
     const id = c.req.param('id');
-    const post = db.prepare('SELECT * FROM research_posts WHERE id = ?').get(id);
+    const post = findPostOwned(id, wid);
     if (!post) return c.json({ error: 'not_found' }, 404);
     const analysis = db.prepare('SELECT * FROM analyses WHERE post_id = ?').get(id);
     return c.json({
@@ -268,23 +308,28 @@ export function createApiRoutes({ getWorkspaceId }) {
   });
 
   api.post('/posts/:id/save', async c => {
+    const wid = getWorkspaceId(c);
     const id = c.req.param('id');
+    const post = findPostOwned(id, wid);
+    if (!post) return c.json({ error: 'not_found' }, 404);
     const body = await c.req.json().catch(() => ({}));
     const val = body.saved === false ? 0 : 1;
-    db.prepare('UPDATE research_posts SET is_saved = ?, updated_at = ? WHERE id = ?').run(val, nowIso(), id);
+    db.prepare('UPDATE research_posts SET is_saved = ?, updated_at = ? WHERE id = ? AND workspace_id = ?')
+      .run(val, nowIso(), id, wid);
     return c.json({ ok: true, is_saved: !!val });
   });
 
   // ---------- analyze ----------
   api.post('/posts/:id/analyze', async c => {
+    const wid = getWorkspaceId(c);
     const id = c.req.param('id');
-    const post = db.prepare('SELECT * FROM research_posts WHERE id = ?').get(id);
+    const post = findPostOwned(id, wid);
     if (!post) return c.json({ error: 'not_found' }, 404);
     const existing = db.prepare('SELECT * FROM analyses WHERE post_id = ?').get(id);
     if (existing) return c.json({ analysis: mapAnalysisRow(existing), cached: true });
 
     const analysis = await analyzePost(mapDbRowToPost(post));
-    if (!analysis) return c.json({ error: 'AI分析に失敗しました' }, 500);
+    if (!analysis) return c.json({ error: 'AI分析に失敗しました。時間をおいて再度お試しください。' }, 500);
     const aid = uid('ana');
     const now = nowIso();
     db.prepare(`INSERT INTO analyses
@@ -329,9 +374,10 @@ export function createApiRoutes({ getWorkspaceId }) {
       WHERE p.workspace_id = ? AND a.id IS NULL
       ORDER BY p.trend_score DESC LIMIT ?`).all(wid, limit);
     const done = [];
+    const failed = [];
     for (const post of rows) {
       const analysis = await analyzePost(mapDbRowToPost(post));
-      if (!analysis) continue;
+      if (!analysis) { failed.push(post.id); continue; }
       const aid = uid('ana');
       db.prepare(`INSERT OR IGNORE INTO analyses
         (id, post_id, summary, topic, target_audience, hook_type, hook, problem, promise,
@@ -357,7 +403,7 @@ export function createApiRoutes({ getWorkspaceId }) {
       });
       done.push(post.id);
     }
-    return c.json({ ok: true, analyzed: done.length, post_ids: done });
+    return c.json({ ok: true, analyzed: done.length, post_ids: done, failed });
   });
 
   // ---------- watch accounts ----------
@@ -384,14 +430,17 @@ export function createApiRoutes({ getWorkspaceId }) {
   });
 
   api.delete('/watch-accounts/:id', c => {
-    db.prepare('DELETE FROM watch_accounts WHERE id = ?').run(c.req.param('id'));
+    const wid = getWorkspaceId(c);
+    const id = c.req.param('id');
+    const info = db.prepare('DELETE FROM watch_accounts WHERE id = ? AND workspace_id = ?').run(id, wid);
+    if (info.changes === 0) return c.json({ error: 'not_found' }, 404);
     return c.json({ ok: true });
   });
 
   // ---------- watch account analysis ----------
   api.get('/watch-accounts/:id/analysis', c => {
     const wid = getWorkspaceId(c);
-    const acc = db.prepare('SELECT * FROM watch_accounts WHERE id = ?').get(c.req.param('id'));
+    const acc = findWatchOwned(c.req.param('id'), wid);
     if (!acc) return c.json({ error: 'not_found' }, 404);
     const since = new Date(Date.now() - 7 * 86400000).toISOString();
     const posts = db.prepare(`SELECT p.*, (SELECT hook_type FROM analyses WHERE post_id = p.id) as hook_type,
@@ -456,13 +505,13 @@ export function createApiRoutes({ getWorkspaceId }) {
     const wid = getWorkspaceId(c);
     const body = await c.req.json();
     const postId = body.post_id;
-    const post = db.prepare('SELECT * FROM research_posts WHERE id = ?').get(postId);
+    const post = findPostOwned(postId, wid);
     if (!post) return c.json({ error: 'not_found' }, 404);
     let analysisRow = db.prepare('SELECT * FROM analyses WHERE post_id = ?').get(postId);
     let analysis = analysisRow ? mapAnalysisRow(analysisRow) : null;
     if (!analysis) {
-      // 分析がなければ先に走らせる
       analysis = await analyzePost(mapDbRowToPost(post));
+      if (!analysis) return c.json({ error: 'AI分析に失敗したためアイデア生成もできません。時間をおいて再度お試しください。' }, 500);
     }
     const profileRow = db.prepare('SELECT * FROM profiles WHERE workspace_id = ?').get(wid);
     const profile = profileRow ? {
@@ -472,7 +521,10 @@ export function createApiRoutes({ getWorkspaceId }) {
       excluded_topics: jsonArray(profileRow.excluded_topics)
     } : {};
     const out = await generateIdeas({ post: mapDbRowToPost(post), analysis, profile });
-    if (!out.ideas || out.ideas.length === 0) return c.json({ error: out.error || 'アイデア生成に失敗しました' }, 500);
+    if (!out.ideas || out.ideas.length === 0) {
+      // validate 2連続失敗 → DBには入れない
+      return c.json({ error: out.error || 'アイデア生成に失敗しました' }, 500);
+    }
     const insert = db.prepare(`INSERT INTO ideas
       (id, workspace_id, source_post_id, title, objective, target, hook, angle, structure,
        key_points, personal_experience_needed, reference_patterns, status, tags, platform,
@@ -507,10 +559,12 @@ export function createApiRoutes({ getWorkspaceId }) {
   });
 
   api.put('/ideas/:id', async c => {
+    const wid = getWorkspaceId(c);
     const id = c.req.param('id');
-    const body = await c.req.json();
-    const cur = db.prepare('SELECT * FROM ideas WHERE id = ?').get(id);
+    const cur = findIdeaOwned(id, wid);
     if (!cur) return c.json({ error: 'not_found' }, 404);
+
+    const body = await c.req.json();
     const next = { ...cur };
     for (const k of ['title','objective','target','hook','angle','status','platform']) {
       if (body[k] !== undefined) next[k] = body[k];
@@ -522,12 +576,14 @@ export function createApiRoutes({ getWorkspaceId }) {
     db.prepare(`UPDATE ideas SET title=@title, objective=@objective, target=@target, hook=@hook, angle=@angle,
       structure=@structure, key_points=@key_points, personal_experience_needed=@personal_experience_needed,
       reference_patterns=@reference_patterns, status=@status, tags=@tags, platform=@platform, updated_at=@updated_at
-      WHERE id=@id`).run(next);
-    return c.json({ ok: true, idea: mapIdeaRow(db.prepare('SELECT * FROM ideas WHERE id = ?').get(id)) });
+      WHERE id=@id AND workspace_id=@workspace_id`).run(next);
+    const updated = db.prepare('SELECT * FROM ideas WHERE id = ? AND workspace_id = ?').get(id, wid);
+    return c.json({ ok: true, idea: mapIdeaRow(updated) });
   });
 
   api.get('/ideas/:id/brief', c => {
-    const idea = db.prepare('SELECT * FROM ideas WHERE id = ?').get(c.req.param('id'));
+    const wid = getWorkspaceId(c);
+    const idea = findIdeaOwned(c.req.param('id'), wid);
     if (!idea) return c.json({ error: 'not_found' }, 404);
     return c.json(ideaToBrief(mapIdeaRow(idea)));
   });
@@ -567,7 +623,7 @@ export function createApiRoutes({ getWorkspaceId }) {
     for (const s of Object.keys(ideaCounts)) {
       ideaCounts[s] = db.prepare('SELECT COUNT(*) AS c FROM ideas WHERE workspace_id = ? AND status = ?').get(wid, s).c;
     }
-    // Hook / topic trends
+    // Hook / topic trends (workspace_id 一致する post の analysis のみ)
     const analyses = db.prepare(`SELECT a.hook_type, a.topic FROM analyses a
       JOIN research_posts p ON p.id = a.post_id WHERE p.workspace_id = ? AND p.is_saved = 1`).all(wid);
     const hooks = countBy(analyses.map(a => a.hook_type).filter(Boolean));

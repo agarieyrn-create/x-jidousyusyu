@@ -1,9 +1,26 @@
 // XAdapter: SocialResearchAdapter の X 実装
 // APIキーが未設定なら search() は空を返し、呼び出し側が DEMO MODE (DB内Mock) を使う。
-// 本番では X API v2 recent search を呼ぶ想定。ここでは骨組みのみ用意する。
+// 本番では X API v2 recent search を呼ぶ。
+// 注意: min_faves / min_retweets はクエリに含めず、取得後にアプリ側でフィルタします。
 
-import { buildXQuery } from './XQueryBuilder.js';
+import { buildXQuery, applyEngagementFilter } from './XQueryBuilder.js';
 import { parseXUrl } from './XUrlParser.js';
+
+/**
+ * X APIエラーをユーザーに理解しやすい日本語メッセージへ変換する。
+ * BearerToken などの機密情報は絶対に含めない。
+ * @param {number} status  HTTP status
+ * @returns {{code: string, message: string}}
+ */
+export function humanizeXApiError(status) {
+  const s = Number(status);
+  if (s === 400) return { code: 'bad_request', message: 'X APIのリクエストが不正です。検索条件を見直してください。' };
+  if (s === 401) return { code: 'unauthorized', message: 'X APIの認証に失敗しました。Bearer Tokenの設定を確認してください。' };
+  if (s === 403) return { code: 'forbidden', message: 'X APIのアクセス権限がありません。プラン/権限を確認してください。' };
+  if (s === 429) return { code: 'rate_limited', message: 'X APIの利用上限に達しました。時間をおいて再度お試しください。' };
+  if (s >= 500 && s < 600) return { code: 'server_error', message: 'X API側で一時的な障害が発生している可能性があります。しばらく待って再度お試しください。' };
+  return { code: 'unknown', message: `X APIでエラーが発生しました (status ${s || 'unknown'})。しばらく待って再度お試しください。` };
+}
 
 export class XAdapter {
   constructor({ bearerToken } = {}) {
@@ -28,16 +45,28 @@ export class XAdapter {
         headers: { Authorization: `Bearer ${this.bearerToken}` }
       });
       if (!res.ok) {
-        const body = await res.text();
-        return { posts: [], mode: 'error', error: `X API ${res.status}: ${body.slice(0, 200)}` };
+        const err = humanizeXApiError(res.status);
+        // レスポンスbody / Authorization header は絶対にログや戻り値に含めない
+        return { posts: [], mode: 'error', error: err.message, error_code: err.code, http_status: res.status };
       }
       const data = await res.json();
       const users = new Map();
       for (const u of (data.includes?.users || [])) users.set(u.id, u);
-      const posts = (data.data || []).map(t => this.normalize(t, users.get(t.author_id), params.keyword));
+      let posts = (data.data || []).map(t => this.normalize(t, users.get(t.author_id), params.keyword));
+      // アプリ側フィルタ (min_faves / min_retweets の代替)
+      posts = applyEngagementFilter(posts, {
+        minLikes: params.minLikes,
+        minReposts: params.minReposts
+      });
       return { posts, mode: 'live' };
     } catch (e) {
-      return { posts: [], mode: 'error', error: String(e?.message || e) };
+      // ネットワーク層エラー: 内部詳細を出しすぎない
+      return {
+        posts: [],
+        mode: 'error',
+        error: 'X APIへの接続に失敗しました。ネットワーク状態を確認してください。',
+        error_code: 'network_error'
+      };
     }
   }
 
@@ -78,7 +107,9 @@ export class XAdapter {
       repost_count: pm.retweet_count || 0,
       reply_count: pm.reply_count || 0,
       quote_count: pm.quote_count || 0,
-      follower_count: user?.public_metrics?.followers_count || 0,
+      // followers_count が undefined の場合は null を保持し、
+      // Trend Score 側で「follower不明」として扱えるようにする。
+      follower_count: (user?.public_metrics?.followers_count ?? null),
       source_keyword: sourceKeyword,
       has_media: !!tweet.attachments?.media_keys?.length
     };

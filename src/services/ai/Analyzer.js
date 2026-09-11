@@ -1,5 +1,6 @@
 // Analyzer: 単一投稿の AI 分析ロジック
 import { createAIProvider, safeParseJson } from './AIProvider.js';
+import { validateAnalysisOutput } from './validators.js';
 
 const ANALYSIS_SCHEMA = {
   summary: 'string',
@@ -20,9 +21,8 @@ const ANALYSIS_SCHEMA = {
   adaptation_direction: 'string[]'
 };
 
-export async function analyzePost(post) {
-  const provider = createAIProvider();
-  const prompt = `# ANALYZE_POST
+function buildPrompt(post) {
+  return `# ANALYZE_POST
 あなたはSNS投稿の構造解析エキスパートです。
 "なぜ伸びたか"は事実として断定せず、必ず"仮説"として扱ってください。
 以下の投稿について、指定JSONスキーマの形式で分析結果のみを返してください。
@@ -42,28 +42,56 @@ follower_count: ${post.follower_count}
 - 固有名詞をそのまま再利用しない
 - ユーザーが応用できる形の"再利用可能な型"を必ず含める
 `;
+}
 
-  let parsed;
+/**
+ * @param {object} post
+ * @returns {Promise<object|null>} DB保存可能な形にvalidate済みの分析JSON。
+ *   validation失敗が2回続いたら null を返す (呼び出し側は保存せずエラー応答)。
+ */
+export async function analyzePost(post) {
+  const provider = createAIProvider();
+  const prompt = buildPrompt(post);
+
+  // --- try 1 ---
+  let raw = null;
   try {
-    parsed = await provider.generateStructuredOutput(prompt, ANALYSIS_SCHEMA);
+    raw = await provider.generateStructuredOutput(prompt, ANALYSIS_SCHEMA);
   } catch (e) {
-    parsed = null;
+    raw = null;
+  }
+  let validated = validateAnalysisOutput(raw);
+  if (validated.ok) {
+    return finalize(validated.value, provider);
   }
 
-  if (!parsed || typeof parsed !== 'object') {
-    // 1回だけ自動修復トライ
-    try {
-      const raw = await provider.generateText(prompt + '\n\n※出力はJSONオブジェクトのみ');
-      parsed = safeParseJson(raw);
-    } catch {}
+  // --- try 2 (1度だけ再生成) ---
+  const retryPrompt = prompt +
+    '\n\n※前回の出力はスキーマに合いませんでした。必ず有効なJSONオブジェクトのみを返してください。\n' +
+    `※各配列フィールド (${['content_structure','emotion','why_it_may_have_worked','reusable_patterns','avoid_copying','adaptation_direction'].join(', ')}) は必ず文字列の配列にしてください。`;
+  let raw2 = null;
+  try {
+    raw2 = await provider.generateStructuredOutput(retryPrompt, ANALYSIS_SCHEMA);
+    if (!raw2 || typeof raw2 !== 'object') {
+      const textOut = await provider.generateText(retryPrompt);
+      raw2 = safeParseJson(textOut);
+    }
+  } catch {
+    raw2 = null;
   }
-  if (!parsed) return null;
+  const validated2 = validateAnalysisOutput(raw2);
+  if (validated2.ok) {
+    return finalize(validated2.value, provider);
+  }
 
-  // Guarantee array fields exist
-  const arrayFields = ['content_structure','emotion','why_it_may_have_worked','reusable_patterns','avoid_copying','adaptation_direction'];
-  for (const f of arrayFields) if (!Array.isArray(parsed[f])) parsed[f] = parsed[f] ? [String(parsed[f])] : [];
+  // 2連続失敗 → null (呼び出し側で 500 返却)
+  return null;
+}
 
-  parsed.model = parsed.model || (provider.isMock ? 'mock-analyzer-v1' : (process.env.AI_MODEL || 'unknown'));
-  parsed.prompt_version = 'v1';
-  return parsed;
+function finalize(value, provider) {
+  return {
+    ...value,
+    model: value.model || (provider.isMock ? 'mock-analyzer-v1' : (process.env.AI_MODEL || 'unknown')),
+    prompt_version: value.prompt_version || 'v1'
+  };
 }

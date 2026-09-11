@@ -1,7 +1,9 @@
 // IdeaGenerator: 投稿+分析+ユーザープロフィールから「自分向けアイデア3案」を生成
-// コピー防止ルールを必ずプロンプトに含める
+// コピー防止ルールを必ずプロンプトに含める。
+// validate 失敗時は1度だけ再生成。それでもダメなら空を返す (呼び出し側はDBに保存しない)。
 
 import { createAIProvider, safeParseJson } from './AIProvider.js';
+import { validateIdeasOutput } from './validators.js';
 
 function similarity(a, b) {
   // 単純な文字bigram Jaccard
@@ -12,15 +14,8 @@ function similarity(a, b) {
   return inter / union;
 }
 
-export async function generateIdeas({ post, analysis, profile }) {
-  const provider = createAIProvider();
-  const schemaHint = {
-    ideas: [{
-      title: 'string', objective: 'string', target: 'string', hook: 'string', angle: 'string',
-      structure: 'string[]', key_points: 'string[]', personal_experience_needed: 'string[]', reference_patterns: 'string[]'
-    }]
-  };
-  const prompt = `# IDEA_GENERATION
+function buildPrompt({ post, analysis, profile, schemaHint }) {
+  return `# IDEA_GENERATION
 あなたはSNSコンテンツ設計の伴走者です。目的は「元投稿のコピー」ではなく、
 "成功パターンを抽象化し、ユーザーのジャンル向けに変換した新規アイデア"を作ることです。
 
@@ -48,27 +43,48 @@ writing_style: ${profile?.writing_style || ''}
 excluded_topics: ${(profile?.excluded_topics || []).join(', ')}
 
 必ず3案。JSONのみで返してください。スキーマ: ${JSON.stringify(schemaHint)}`;
+}
 
-  let out;
+export async function generateIdeas({ post, analysis, profile }) {
+  const provider = createAIProvider();
+  const schemaHint = {
+    ideas: [{
+      title: 'string', objective: 'string', target: 'string', hook: 'string', angle: 'string',
+      structure: 'string[]', key_points: 'string[]', personal_experience_needed: 'string[]', reference_patterns: 'string[]'
+    }]
+  };
+  const prompt = buildPrompt({ post, analysis, profile, schemaHint });
+
+  // --- try 1 ---
+  let raw = null;
   try {
-    out = await provider.generateStructuredOutput(prompt, schemaHint);
-  } catch {
-    out = null;
-  }
-  if (!out || !Array.isArray(out.ideas) || out.ideas.length === 0) {
-    // 1度リトライ
+    raw = await provider.generateStructuredOutput(prompt, schemaHint);
+  } catch { raw = null; }
+  let validated = validateIdeasOutput(raw);
+
+  if (!validated.ok) {
+    // --- try 2 (1度だけ再生成) ---
+    const retryPrompt = prompt + '\n\n※前回の出力はスキーマに合いませんでした。必ず有効なJSONのみを返してください。ideas は必ず配列で、各要素の personal_experience_needed は必ず埋めてください。';
+    let raw2 = null;
     try {
-      const raw = await provider.generateText(prompt + '\n\n※JSONのみを返す');
-      out = safeParseJson(raw);
-    } catch {}
+      raw2 = await provider.generateStructuredOutput(retryPrompt, schemaHint);
+      if (!raw2) {
+        const textOut = await provider.generateText(retryPrompt);
+        raw2 = safeParseJson(textOut);
+      }
+    } catch { raw2 = null; }
+    validated = validateIdeasOutput(raw2);
   }
-  if (!out || !Array.isArray(out.ideas)) return { ideas: [], error: 'AI生成に失敗しました' };
+
+  if (!validated.ok) {
+    return { ideas: [], error: 'AI生成に失敗しました', validation_errors: validated.errors };
+  }
 
   // コピー防止フィルタ: 元投稿と類似度が高すぎるものを弾く
-  const filtered = out.ideas.filter(idea => {
+  const filtered = validated.value.ideas.filter(idea => {
     const combined = `${idea.title} ${idea.hook} ${idea.angle}`;
     return similarity(combined, post.text) < 0.55;
   });
 
-  return { ideas: filtered.length >= 1 ? filtered : out.ideas };
+  return { ideas: filtered.length >= 1 ? filtered : validated.value.ideas };
 }
