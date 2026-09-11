@@ -1,0 +1,636 @@
+// API routes (Hono). UIコンポーネントから直接DBを触らずここに集約。
+import { Hono } from 'hono';
+import { db, jsonArray, toJson, nowIso, uid } from '../db/index.js';
+import { computeTrendScoreBatch } from '../services/scoring/TrendScore.js';
+import { XAdapter } from '../services/social/x/XAdapter.js';
+import { ManualAdapter } from '../services/social/manual/ManualAdapter.js';
+import { generateKeywords } from '../services/ai/KeywordGenerator.js';
+import { analyzePost } from '../services/ai/Analyzer.js';
+import { generateIdeas } from '../services/ai/IdeaGenerator.js';
+import { ideasToCsv } from '../services/export/CsvExporter.js';
+import { ideasToJson, ideaToBrief } from '../services/export/JsonExporter.js';
+import { parseXUrl } from '../services/social/x/XUrlParser.js';
+
+export function createApiRoutes({ getWorkspaceId }) {
+  const api = new Hono();
+
+  // ---------- health / status ----------
+  api.get('/status', c => {
+    const x = new XAdapter();
+    const aiProvider = (process.env.AI_PROVIDER || '').toLowerCase();
+    const aiKey = !!process.env.AI_API_KEY;
+    return c.json({
+      app: 'content-research-radar',
+      env: process.env.APP_ENV || 'development',
+      demo_mode: !x.isConfigured() || !aiKey,
+      integrations: {
+        x_api: x.isConfigured() ? 'connected' : 'not_configured',
+        ai: aiKey && aiProvider ? `${aiProvider}:connected` : 'mock'
+      }
+    });
+  });
+
+  // ---------- profile ----------
+  api.get('/profile', c => {
+    const wid = getWorkspaceId(c);
+    const row = db.prepare('SELECT * FROM profiles WHERE workspace_id = ?').get(wid);
+    if (!row) return c.json({ profile: null });
+    return c.json({
+      profile: {
+        ...row,
+        sub_topics: jsonArray(row.sub_topics),
+        objectives: jsonArray(row.objectives),
+        excluded_topics: jsonArray(row.excluded_topics)
+      }
+    });
+  });
+
+  api.put('/profile', async c => {
+    const wid = getWorkspaceId(c);
+    const body = await c.req.json();
+    const existing = db.prepare('SELECT id FROM profiles WHERE workspace_id = ?').get(wid);
+    const now = nowIso();
+    if (existing) {
+      db.prepare(`UPDATE profiles SET main_topic=?, sub_topics=?, target_audience=?, objectives=?,
+        writing_style=?, excluded_topics=?, updated_at=? WHERE workspace_id=?`).run(
+        body.main_topic || '',
+        toJson(body.sub_topics || []),
+        body.target_audience || '',
+        toJson(body.objectives || []),
+        body.writing_style || '',
+        toJson(body.excluded_topics || []),
+        now, wid
+      );
+    } else {
+      db.prepare(`INSERT INTO profiles (id, workspace_id, main_topic, sub_topics, target_audience,
+        objectives, writing_style, excluded_topics, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+        uid('prf'), wid, body.main_topic || '',
+        toJson(body.sub_topics || []),
+        body.target_audience || '',
+        toJson(body.objectives || []),
+        body.writing_style || '',
+        toJson(body.excluded_topics || []),
+        now, now
+      );
+    }
+    return c.json({ ok: true });
+  });
+
+  // ---------- keywords ----------
+  api.get('/keywords', c => {
+    const wid = getWorkspaceId(c);
+    const rows = db.prepare('SELECT * FROM research_keywords WHERE workspace_id = ? ORDER BY created_at DESC').all(wid);
+    return c.json({ keywords: rows });
+  });
+
+  api.post('/keywords', async c => {
+    const wid = getWorkspaceId(c);
+    const body = await c.req.json();
+    if (body.regenerate) {
+      const profile = db.prepare('SELECT * FROM profiles WHERE workspace_id = ?').get(wid);
+      const gen = await generateKeywords({
+        mainTopic: profile?.main_topic,
+        subTopics: jsonArray(profile?.sub_topics),
+        targetAudience: profile?.target_audience
+      });
+      // 既存の "ai" ソースを残しつつ提案候補として返す (自動確定しない)
+      return c.json({ suggestions: gen.keywords, source: gen.source });
+    }
+    const now = nowIso();
+    const list = Array.isArray(body.keywords) ? body.keywords : (body.keyword ? [body.keyword] : []);
+    const inserted = [];
+    for (const k of list) {
+      if (!k) continue;
+      const id = uid('kw');
+      try {
+        db.prepare('INSERT INTO research_keywords (id, workspace_id, keyword, is_active, source, created_at) VALUES (?, ?, ?, 1, ?, ?)')
+          .run(id, wid, k, body.source || 'user', now);
+        inserted.push({ id, keyword: k });
+      } catch (e) {
+        // ignore duplicate
+      }
+    }
+    return c.json({ ok: true, inserted });
+  });
+
+  api.put('/keywords/:id', async c => {
+    const id = c.req.param('id');
+    const body = await c.req.json();
+    const fields = [];
+    const vals = [];
+    if (body.keyword !== undefined) { fields.push('keyword = ?'); vals.push(body.keyword); }
+    if (body.is_active !== undefined) { fields.push('is_active = ?'); vals.push(body.is_active ? 1 : 0); }
+    if (fields.length === 0) return c.json({ ok: true });
+    vals.push(id);
+    db.prepare(`UPDATE research_keywords SET ${fields.join(', ')} WHERE id = ?`).run(...vals);
+    return c.json({ ok: true });
+  });
+
+  api.delete('/keywords/:id', c => {
+    db.prepare('DELETE FROM research_keywords WHERE id = ?').run(c.req.param('id'));
+    return c.json({ ok: true });
+  });
+
+  // ---------- research search ----------
+  api.post('/research/search', async c => {
+    const wid = getWorkspaceId(c);
+    const body = await c.req.json();
+    const {
+      keywords = [], days = 7, minLikes = 0, minReposts = 0,
+      language = 'ja', excludeReposts = true, excludeReplies = false,
+      excludeKeywords = [], fromUsername
+    } = body;
+
+    const status = [];
+    const x = new XAdapter();
+    let live = 0, demoUsed = 0, duplicates = 0;
+    const results = [];
+
+    const keywordList = keywords.length > 0
+      ? keywords
+      : db.prepare('SELECT keyword FROM research_keywords WHERE workspace_id = ? AND is_active = 1 LIMIT 5').all(wid).map(r => r.keyword);
+
+    if (x.isConfigured() && keywordList.length > 0) {
+      status.push(`Xから投稿を取得しています (${keywordList.length}キーワード)`);
+      for (const kw of keywordList.slice(0, 5)) {
+        const r = await x.search({
+          keyword: kw, language, minLikes, minReposts,
+          excludeKeywords, fromUsername,
+          excludeReposts, excludeReplies, perKeyword: 20
+        });
+        if (r.mode === 'error') status.push(`X APIエラー: ${r.error}`);
+        for (const p of r.posts) {
+          results.push({ ...p, source_keyword: kw });
+          live++;
+        }
+      }
+    } else {
+      status.push('DEMO MODE: 保存済みモックデータからフィルタします');
+      const since = new Date(Date.now() - days * 86400000).toISOString();
+      const rows = db.prepare(`SELECT * FROM research_posts WHERE workspace_id = ? AND published_at >= ?
+        AND like_count >= ? AND repost_count >= ?`).all(wid, since, minLikes, minReposts);
+      let filtered = rows;
+      if (keywordList.length > 0) {
+        filtered = filtered.filter(r =>
+          keywordList.some(k => (r.text || '').toLowerCase().includes(k.toLowerCase()) || r.source_keyword === k)
+        );
+      }
+      if (fromUsername) {
+        filtered = filtered.filter(r => (r.username || '') === fromUsername.replace(/^@/, ''));
+      }
+      if (excludeKeywords.length) {
+        filtered = filtered.filter(r => !excludeKeywords.some(k => (r.text || '').includes(k)));
+      }
+      demoUsed = filtered.length;
+      const scored = computeTrendScoreBatch(filtered);
+      // scoreをDBにも更新しておく
+      const upd = db.prepare('UPDATE research_posts SET trend_score = ? WHERE id = ?');
+      for (const p of scored) upd.run(p.trend_score, p.id);
+      status.push(`${demoUsed}件取得しました`);
+      status.push('Trend Scoreを計算しました');
+      return c.json({
+        mode: 'demo',
+        status,
+        posts: scored.map(mapDbRowToPost),
+        stats: { live: 0, demo: demoUsed, duplicates: 0 }
+      });
+    }
+
+    // Live: 重複排除 + DB挿入 + score
+    status.push(`${results.length}件取得しました`);
+    const dedup = [];
+    const seen = new Set();
+    for (const p of results) {
+      const key = `x:${p.external_post_id}`;
+      if (seen.has(key)) { duplicates++; continue; }
+      seen.add(key);
+      dedup.push(p);
+    }
+    status.push(`重複${duplicates}件を除外しました`);
+    const scored = computeTrendScoreBatch(dedup);
+    const insertStmt = db.prepare(`INSERT OR IGNORE INTO research_posts
+      (id, workspace_id, platform, external_post_id, author_id, username, display_name,
+       text, url, published_at, like_count, repost_count, reply_count, quote_count, follower_count,
+       trend_score, source_keyword, is_saved, has_media, created_at, updated_at)
+      VALUES (@id, @workspace_id, @platform, @external_post_id, @author_id, @username, @display_name,
+              @text, @url, @published_at, @like_count, @repost_count, @reply_count, @quote_count, @follower_count,
+              @trend_score, @source_keyword, 0, @has_media, @created_at, @updated_at)`);
+    const now = nowIso();
+    for (const p of scored) {
+      insertStmt.run({
+        id: uid('pst'),
+        workspace_id: wid, platform: 'x',
+        external_post_id: p.external_post_id,
+        author_id: p.author_id, username: p.username, display_name: p.display_name,
+        text: p.text, url: p.url, published_at: p.published_at,
+        like_count: p.like_count, repost_count: p.repost_count, reply_count: p.reply_count,
+        quote_count: p.quote_count, follower_count: p.follower_count,
+        trend_score: p.trend_score, source_keyword: p.source_keyword,
+        has_media: p.has_media ? 1 : 0,
+        created_at: now, updated_at: now
+      });
+    }
+    status.push('Trend Scoreを計算しました');
+    const savedRows = db.prepare(`SELECT * FROM research_posts WHERE workspace_id = ? AND external_post_id IN (${dedup.map(() => '?').join(',') || "''"})`)
+      .all(wid, ...dedup.map(p => p.external_post_id));
+    return c.json({
+      mode: 'live',
+      status,
+      posts: savedRows.map(mapDbRowToPost),
+      stats: { live, demo: 0, duplicates }
+    });
+  });
+
+  // ---------- posts ----------
+  api.get('/posts', c => {
+    const wid = getWorkspaceId(c);
+    const savedOnly = c.req.query('saved') === '1';
+    const sort = c.req.query('sort') || 'trend_score';
+    const dir = c.req.query('dir') === 'asc' ? 'ASC' : 'DESC';
+    const allowedSort = ['trend_score','like_count','repost_count','reply_count','published_at','created_at'];
+    const s = allowedSort.includes(sort) ? sort : 'trend_score';
+    const where = savedOnly ? 'AND is_saved = 1' : '';
+    const rows = db.prepare(`SELECT p.*, (SELECT 1 FROM analyses a WHERE a.post_id = p.id) AS has_analysis
+      FROM research_posts p WHERE workspace_id = ? ${where} ORDER BY ${s} ${dir} LIMIT 200`).all(wid);
+    return c.json({ posts: rows.map(mapDbRowToPost) });
+  });
+
+  api.get('/posts/:id', c => {
+    const id = c.req.param('id');
+    const post = db.prepare('SELECT * FROM research_posts WHERE id = ?').get(id);
+    if (!post) return c.json({ error: 'not_found' }, 404);
+    const analysis = db.prepare('SELECT * FROM analyses WHERE post_id = ?').get(id);
+    return c.json({
+      post: mapDbRowToPost(post),
+      analysis: analysis ? mapAnalysisRow(analysis) : null
+    });
+  });
+
+  api.post('/posts/:id/save', async c => {
+    const id = c.req.param('id');
+    const body = await c.req.json().catch(() => ({}));
+    const val = body.saved === false ? 0 : 1;
+    db.prepare('UPDATE research_posts SET is_saved = ?, updated_at = ? WHERE id = ?').run(val, nowIso(), id);
+    return c.json({ ok: true, is_saved: !!val });
+  });
+
+  // ---------- analyze ----------
+  api.post('/posts/:id/analyze', async c => {
+    const id = c.req.param('id');
+    const post = db.prepare('SELECT * FROM research_posts WHERE id = ?').get(id);
+    if (!post) return c.json({ error: 'not_found' }, 404);
+    const existing = db.prepare('SELECT * FROM analyses WHERE post_id = ?').get(id);
+    if (existing) return c.json({ analysis: mapAnalysisRow(existing), cached: true });
+
+    const analysis = await analyzePost(mapDbRowToPost(post));
+    if (!analysis) return c.json({ error: 'AI分析に失敗しました' }, 500);
+    const aid = uid('ana');
+    const now = nowIso();
+    db.prepare(`INSERT INTO analyses
+      (id, post_id, summary, topic, target_audience, hook_type, hook, problem, promise,
+       content_structure, cta_type, cta, emotion, novelty,
+       why_it_may_have_worked, reusable_patterns, avoid_copying, adaptation_direction,
+       model, prompt_version, created_at)
+      VALUES (@id, @post_id, @summary, @topic, @target_audience, @hook_type, @hook, @problem, @promise,
+              @content_structure, @cta_type, @cta, @emotion, @novelty,
+              @why, @reusable, @avoid, @adapt, @model, @prompt_version, @created_at)`).run({
+      id: aid, post_id: id,
+      summary: analysis.summary || '',
+      topic: analysis.topic || '',
+      target_audience: analysis.target_audience || '',
+      hook_type: analysis.hook_type || '',
+      hook: analysis.hook || '',
+      problem: analysis.problem || '',
+      promise: analysis.promise || '',
+      content_structure: toJson(analysis.content_structure || []),
+      cta_type: analysis.cta_type || '',
+      cta: analysis.cta || '',
+      emotion: toJson(analysis.emotion || []),
+      novelty: analysis.novelty || '',
+      why: toJson(analysis.why_it_may_have_worked || []),
+      reusable: toJson(analysis.reusable_patterns || []),
+      avoid: toJson(analysis.avoid_copying || []),
+      adapt: toJson(analysis.adaptation_direction || []),
+      model: analysis.model || '',
+      prompt_version: analysis.prompt_version || 'v1',
+      created_at: now
+    });
+    const saved = db.prepare('SELECT * FROM analyses WHERE id = ?').get(aid);
+    return c.json({ analysis: mapAnalysisRow(saved), cached: false });
+  });
+
+  api.post('/posts/analyze-top', async c => {
+    const wid = getWorkspaceId(c);
+    const body = await c.req.json().catch(() => ({}));
+    const limit = Math.max(1, Math.min(20, Number(body.limit) || 10));
+    const rows = db.prepare(`SELECT p.* FROM research_posts p
+      LEFT JOIN analyses a ON a.post_id = p.id
+      WHERE p.workspace_id = ? AND a.id IS NULL
+      ORDER BY p.trend_score DESC LIMIT ?`).all(wid, limit);
+    const done = [];
+    for (const post of rows) {
+      const analysis = await analyzePost(mapDbRowToPost(post));
+      if (!analysis) continue;
+      const aid = uid('ana');
+      db.prepare(`INSERT OR IGNORE INTO analyses
+        (id, post_id, summary, topic, target_audience, hook_type, hook, problem, promise,
+         content_structure, cta_type, cta, emotion, novelty,
+         why_it_may_have_worked, reusable_patterns, avoid_copying, adaptation_direction,
+         model, prompt_version, created_at)
+        VALUES (@id, @post_id, @summary, @topic, @target_audience, @hook_type, @hook, @problem, @promise,
+                @content_structure, @cta_type, @cta, @emotion, @novelty,
+                @why, @reusable, @avoid, @adapt, @model, @prompt_version, @created_at)`).run({
+        id: aid, post_id: post.id,
+        summary: analysis.summary || '', topic: analysis.topic || '',
+        target_audience: analysis.target_audience || '', hook_type: analysis.hook_type || '',
+        hook: analysis.hook || '', problem: analysis.problem || '', promise: analysis.promise || '',
+        content_structure: toJson(analysis.content_structure || []),
+        cta_type: analysis.cta_type || '', cta: analysis.cta || '',
+        emotion: toJson(analysis.emotion || []), novelty: analysis.novelty || '',
+        why: toJson(analysis.why_it_may_have_worked || []),
+        reusable: toJson(analysis.reusable_patterns || []),
+        avoid: toJson(analysis.avoid_copying || []),
+        adapt: toJson(analysis.adaptation_direction || []),
+        model: analysis.model || '', prompt_version: analysis.prompt_version || 'v1',
+        created_at: nowIso()
+      });
+      done.push(post.id);
+    }
+    return c.json({ ok: true, analyzed: done.length, post_ids: done });
+  });
+
+  // ---------- watch accounts ----------
+  api.get('/watch-accounts', c => {
+    const wid = getWorkspaceId(c);
+    const rows = db.prepare('SELECT * FROM watch_accounts WHERE workspace_id = ? ORDER BY created_at DESC').all(wid);
+    return c.json({ accounts: rows.map(r => ({ ...r, tags: jsonArray(r.tags) })) });
+  });
+
+  api.post('/watch-accounts', async c => {
+    const wid = getWorkspaceId(c);
+    const body = await c.req.json();
+    const id = uid('wa');
+    db.prepare(`INSERT INTO watch_accounts
+      (id, workspace_id, platform, username, display_name, external_user_id, followers, tags, memo, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+      id, wid, body.platform || 'x',
+      (body.username || '').replace(/^@/, ''),
+      body.display_name || null, body.external_user_id || null,
+      Number(body.followers) || 0,
+      toJson(body.tags || []), body.memo || null, nowIso()
+    );
+    return c.json({ ok: true, id });
+  });
+
+  api.delete('/watch-accounts/:id', c => {
+    db.prepare('DELETE FROM watch_accounts WHERE id = ?').run(c.req.param('id'));
+    return c.json({ ok: true });
+  });
+
+  // ---------- watch account analysis ----------
+  api.get('/watch-accounts/:id/analysis', c => {
+    const wid = getWorkspaceId(c);
+    const acc = db.prepare('SELECT * FROM watch_accounts WHERE id = ?').get(c.req.param('id'));
+    if (!acc) return c.json({ error: 'not_found' }, 404);
+    const since = new Date(Date.now() - 7 * 86400000).toISOString();
+    const posts = db.prepare(`SELECT p.*, (SELECT hook_type FROM analyses WHERE post_id = p.id) as hook_type,
+      (SELECT topic FROM analyses WHERE post_id = p.id) as topic,
+      (SELECT cta_type FROM analyses WHERE post_id = p.id) as cta_type
+      FROM research_posts p WHERE workspace_id = ? AND username = ? AND published_at >= ?`)
+      .all(wid, acc.username, since);
+    if (posts.length === 0) return c.json({ account: { ...acc, tags: jsonArray(acc.tags) }, stats: null, posts: [] });
+    const avg = arr => arr.length ? Math.round(arr.reduce((a, b) => a + b, 0) / arr.length) : 0;
+    const stats = {
+      count: posts.length,
+      avg_likes: avg(posts.map(p => p.like_count)),
+      avg_reposts: avg(posts.map(p => p.repost_count)),
+      avg_replies: avg(posts.map(p => p.reply_count)),
+      avg_trend_score: Math.round(avg(posts.map(p => p.trend_score || 0)) * 100) / 100,
+      hooks: countBy(posts.map(p => p.hook_type).filter(Boolean)),
+      topics: countBy(posts.map(p => p.topic).filter(Boolean)),
+      ctas: countBy(posts.map(p => p.cta_type).filter(Boolean))
+    };
+    const top = [...posts].sort((a, b) => (b.trend_score || 0) - (a.trend_score || 0)).slice(0, 5);
+    return c.json({ account: { ...acc, tags: jsonArray(acc.tags) }, stats, posts: top.map(mapDbRowToPost) });
+  });
+
+  // ---------- manual import ----------
+  api.post('/manual-import', async c => {
+    const wid = getWorkspaceId(c);
+    const body = await c.req.json();
+    const adapter = new ManualAdapter();
+    let normalized;
+    if (body.type === 'url') {
+      normalized = await adapter.importFromUrl({ url: body.url, memo: body.memo, tags: body.tags });
+    } else {
+      normalized = adapter.importFromText({
+        text: body.text, url: body.url, username: body.username,
+        platform: body.platform, memo: body.memo, tags: body.tags
+      });
+    }
+    const scored = computeTrendScoreBatch([normalized])[0];
+    const id = uid('pst');
+    const now = nowIso();
+    try {
+      db.prepare(`INSERT INTO research_posts
+        (id, workspace_id, platform, external_post_id, author_id, username, display_name,
+         text, url, published_at, like_count, repost_count, reply_count, quote_count, follower_count,
+         trend_score, source_keyword, is_saved, has_media, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)`).run(
+        id, wid, scored.platform || 'manual', scored.external_post_id, scored.author_id || null,
+        scored.username || null, scored.display_name || null, scored.text || '',
+        scored.url || null, scored.published_at,
+        scored.like_count || 0, scored.repost_count || 0, scored.reply_count || 0, scored.quote_count || 0,
+        scored.follower_count || 0, scored.trend_score || 0, null,
+        scored.has_media ? 1 : 0, now, now
+      );
+    } catch (e) {
+      return c.json({ error: '重複投稿またはDBエラー', detail: String(e.message) }, 409);
+    }
+    return c.json({ ok: true, id });
+  });
+
+  // ---------- ideas ----------
+  api.post('/ideas/generate', async c => {
+    const wid = getWorkspaceId(c);
+    const body = await c.req.json();
+    const postId = body.post_id;
+    const post = db.prepare('SELECT * FROM research_posts WHERE id = ?').get(postId);
+    if (!post) return c.json({ error: 'not_found' }, 404);
+    let analysisRow = db.prepare('SELECT * FROM analyses WHERE post_id = ?').get(postId);
+    let analysis = analysisRow ? mapAnalysisRow(analysisRow) : null;
+    if (!analysis) {
+      // 分析がなければ先に走らせる
+      analysis = await analyzePost(mapDbRowToPost(post));
+    }
+    const profileRow = db.prepare('SELECT * FROM profiles WHERE workspace_id = ?').get(wid);
+    const profile = profileRow ? {
+      ...profileRow,
+      sub_topics: jsonArray(profileRow.sub_topics),
+      objectives: jsonArray(profileRow.objectives),
+      excluded_topics: jsonArray(profileRow.excluded_topics)
+    } : {};
+    const out = await generateIdeas({ post: mapDbRowToPost(post), analysis, profile });
+    if (!out.ideas || out.ideas.length === 0) return c.json({ error: out.error || 'アイデア生成に失敗しました' }, 500);
+    const insert = db.prepare(`INSERT INTO ideas
+      (id, workspace_id, source_post_id, title, objective, target, hook, angle, structure,
+       key_points, personal_experience_needed, reference_patterns, status, tags, platform,
+       created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Inbox', ?, 'x', ?, ?)`);
+    const now = nowIso();
+    const ids = [];
+    for (const idea of out.ideas) {
+      const iid = uid('idea');
+      insert.run(iid, wid, postId,
+        idea.title || '', idea.objective || '', idea.target || '',
+        idea.hook || '', idea.angle || '',
+        toJson(idea.structure || []),
+        toJson(idea.key_points || []),
+        toJson(idea.personal_experience_needed || []),
+        toJson(idea.reference_patterns || []),
+        toJson(idea.tags || []),
+        now, now);
+      ids.push(iid);
+    }
+    const rows = db.prepare(`SELECT * FROM ideas WHERE id IN (${ids.map(() => '?').join(',')})`).all(...ids);
+    return c.json({ ideas: rows.map(mapIdeaRow) });
+  });
+
+  api.get('/ideas', c => {
+    const wid = getWorkspaceId(c);
+    const status = c.req.query('status');
+    const where = status ? 'AND status = ?' : '';
+    const vals = status ? [wid, status] : [wid];
+    const rows = db.prepare(`SELECT * FROM ideas WHERE workspace_id = ? ${where} ORDER BY created_at DESC`).all(...vals);
+    return c.json({ ideas: rows.map(mapIdeaRow) });
+  });
+
+  api.put('/ideas/:id', async c => {
+    const id = c.req.param('id');
+    const body = await c.req.json();
+    const cur = db.prepare('SELECT * FROM ideas WHERE id = ?').get(id);
+    if (!cur) return c.json({ error: 'not_found' }, 404);
+    const next = { ...cur };
+    for (const k of ['title','objective','target','hook','angle','status','platform']) {
+      if (body[k] !== undefined) next[k] = body[k];
+    }
+    for (const k of ['structure','key_points','personal_experience_needed','reference_patterns','tags']) {
+      if (body[k] !== undefined) next[k] = toJson(body[k]);
+    }
+    next.updated_at = nowIso();
+    db.prepare(`UPDATE ideas SET title=@title, objective=@objective, target=@target, hook=@hook, angle=@angle,
+      structure=@structure, key_points=@key_points, personal_experience_needed=@personal_experience_needed,
+      reference_patterns=@reference_patterns, status=@status, tags=@tags, platform=@platform, updated_at=@updated_at
+      WHERE id=@id`).run(next);
+    return c.json({ ok: true, idea: mapIdeaRow(db.prepare('SELECT * FROM ideas WHERE id = ?').get(id)) });
+  });
+
+  api.get('/ideas/:id/brief', c => {
+    const idea = db.prepare('SELECT * FROM ideas WHERE id = ?').get(c.req.param('id'));
+    if (!idea) return c.json({ error: 'not_found' }, 404);
+    return c.json(ideaToBrief(mapIdeaRow(idea)));
+  });
+
+  // ---------- exports ----------
+  api.get('/export/ideas.csv', c => {
+    const wid = getWorkspaceId(c);
+    const rows = db.prepare('SELECT * FROM ideas WHERE workspace_id = ?').all(wid).map(mapIdeaRow);
+    return new Response(ideasToCsv(rows), {
+      headers: {
+        'Content-Type': 'text/csv; charset=utf-8',
+        'Content-Disposition': 'attachment; filename="ideas.csv"'
+      }
+    });
+  });
+
+  api.get('/export/ideas.json', c => {
+    const wid = getWorkspaceId(c);
+    const rows = db.prepare('SELECT * FROM ideas WHERE workspace_id = ?').all(wid).map(mapIdeaRow);
+    return new Response(JSON.stringify(ideasToJson(rows), null, 2), {
+      headers: {
+        'Content-Type': 'application/json; charset=utf-8',
+        'Content-Disposition': 'attachment; filename="ideas.json"'
+      }
+    });
+  });
+
+  // ---------- dashboard ----------
+  api.get('/dashboard', c => {
+    const wid = getWorkspaceId(c);
+    const today = new Date(); today.setHours(0, 0, 0, 0);
+    const todayIso = today.toISOString();
+    const todayCount = db.prepare('SELECT COUNT(*) AS c FROM research_posts WHERE workspace_id = ? AND created_at >= ?').get(wid, todayIso).c;
+    const top = db.prepare('SELECT * FROM research_posts WHERE workspace_id = ? ORDER BY trend_score DESC LIMIT 5').all(wid);
+    const recentSaved = db.prepare('SELECT * FROM research_posts WHERE workspace_id = ? AND is_saved = 1 ORDER BY updated_at DESC LIMIT 5').all(wid);
+    const ideaCounts = { Inbox: 0, '採用候補': 0, '採用': 0 };
+    for (const s of Object.keys(ideaCounts)) {
+      ideaCounts[s] = db.prepare('SELECT COUNT(*) AS c FROM ideas WHERE workspace_id = ? AND status = ?').get(wid, s).c;
+    }
+    // Hook / topic trends
+    const analyses = db.prepare(`SELECT a.hook_type, a.topic FROM analyses a
+      JOIN research_posts p ON p.id = a.post_id WHERE p.workspace_id = ? AND p.is_saved = 1`).all(wid);
+    const hooks = countBy(analyses.map(a => a.hook_type).filter(Boolean));
+    const topics = countBy(analyses.map(a => a.topic).filter(Boolean));
+    return c.json({
+      today_count: todayCount,
+      top_posts: top.map(mapDbRowToPost),
+      recent_saved: recentSaved.map(mapDbRowToPost),
+      idea_counts: ideaCounts,
+      hooks, topics
+    });
+  });
+
+  return api;
+}
+
+// --------- helpers ---------
+function mapDbRowToPost(r) {
+  return {
+    id: r.id, workspace_id: r.workspace_id, platform: r.platform,
+    external_post_id: r.external_post_id, author_id: r.author_id,
+    username: r.username, display_name: r.display_name,
+    text: r.text, url: r.url, published_at: r.published_at,
+    like_count: r.like_count, repost_count: r.repost_count,
+    reply_count: r.reply_count, quote_count: r.quote_count,
+    follower_count: r.follower_count, trend_score: r.trend_score,
+    source_keyword: r.source_keyword,
+    is_saved: !!r.is_saved, has_media: !!r.has_media,
+    has_analysis: r.has_analysis === 1 || r.has_analysis === true,
+    created_at: r.created_at, updated_at: r.updated_at
+  };
+}
+
+function mapAnalysisRow(r) {
+  return {
+    id: r.id, post_id: r.post_id,
+    summary: r.summary, topic: r.topic, target_audience: r.target_audience,
+    hook_type: r.hook_type, hook: r.hook, problem: r.problem, promise: r.promise,
+    content_structure: jsonArray(r.content_structure),
+    cta_type: r.cta_type, cta: r.cta,
+    emotion: jsonArray(r.emotion), novelty: r.novelty,
+    why_it_may_have_worked: jsonArray(r.why_it_may_have_worked),
+    reusable_patterns: jsonArray(r.reusable_patterns),
+    avoid_copying: jsonArray(r.avoid_copying),
+    adaptation_direction: jsonArray(r.adaptation_direction),
+    model: r.model, prompt_version: r.prompt_version, created_at: r.created_at
+  };
+}
+
+function mapIdeaRow(r) {
+  return {
+    id: r.id, workspace_id: r.workspace_id, source_post_id: r.source_post_id,
+    title: r.title, objective: r.objective, target: r.target, hook: r.hook, angle: r.angle,
+    structure: jsonArray(r.structure), key_points: jsonArray(r.key_points),
+    personal_experience_needed: jsonArray(r.personal_experience_needed),
+    reference_patterns: jsonArray(r.reference_patterns),
+    status: r.status, tags: jsonArray(r.tags), platform: r.platform,
+    created_at: r.created_at, updated_at: r.updated_at
+  };
+}
+
+function countBy(arr) {
+  const m = {};
+  for (const v of arr) m[v] = (m[v] || 0) + 1;
+  return Object.entries(m).map(([k, v]) => ({ key: k, count: v })).sort((a, b) => b.count - a.count);
+}

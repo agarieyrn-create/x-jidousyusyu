@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Content Research Radar</title>
+  <link rel="stylesheet" href="/css/app.css">
+</head>
+<body>
+  <div id="app">
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="brand-logo">CR</div>
+        <div class="brand-name">Content<br>Research Radar</div>
+      </div>
+      <nav class="nav">
+        <a class="nav-item" data-route="dashboard"><span class="ic">🏠</span>Dashboard</a>
+        <a class="nav-item" data-route="discover"><span class="ic">🔍</span>Discover</a>
+        <a class="nav-item" data-route="library"><span class="ic">📚</span>Research Library</a>
+        <a class="nav-item" data-route="ideas"><span class="ic">💡</span>Ideas</a>
+        <a class="nav-item" data-route="watch"><span class="ic">👥</span>Watch Accounts</a>
+        <a class="nav-item" data-route="settings"><span class="ic">⚙️</span>Settings</a>
+      </nav>
+      <div class="sidebar-footer">
+        <div id="mode-badge" class="mode-badge">DEMO MODE</div>
+        <div class="hint">競合投稿から成功パターンを抽出し、あなた独自のアイデアに変換します</div>
+      </div>
+    </aside>
+    <main class="main">
+      <header class="topbar">
+        <div id="page-title" class="page-title">Dashboard</div>
+        <div id="status-bar" class="status-bar"></div>
+      </header>
+      <section id="view" class="view"></section>
+    </main>
+  </div>
+
+  <div id="drawer" class="drawer hidden">
+    <div class="drawer-backdrop" data-close></div>
+    <div class="drawer-panel" id="drawer-panel"></div>
+  </div>
+
+  <div id="toast" class="toast hidden"></div>
+
+  <script type="module" src="/js/app.js"></script>
+</body>
+</html>
