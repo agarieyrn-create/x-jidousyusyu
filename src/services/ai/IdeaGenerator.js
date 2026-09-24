@@ -11,6 +11,8 @@ import { createAIProvider, safeParseJson } from './AIProvider.js';
 import { validateIdeasOutput, IDEAS_MIN_COUNT } from './validators.js';
 
 const COPY_SIM_THRESHOLD = 0.55;
+// アイデア同士の近似重複判定 (hookだけ違う・言い回し違いの同一案を弾く)
+const IDEA_DUP_THRESHOLD = 0.6;
 
 function similarity(a, b) {
   // 単純な文字bigram Jaccard
@@ -26,8 +28,17 @@ function isTooSimilar(idea, postText) {
   return similarity(combined, postText) >= COPY_SIM_THRESHOLD;
 }
 
-function ideaFingerprint(idea) {
-  return `${(idea.title || '').trim()}|${(idea.hook || '').trim()}`;
+function ideaText(idea) {
+  return `${idea.title || ''} ${idea.hook || ''}`;
+}
+
+// 既に採用済みの案と、完全一致または近似(類似度>=IDEA_DUP_THRESHOLD)なら重複
+export function isDuplicateIdea(idea, accepted) {
+  const t = ideaText(idea).trim();
+  return accepted.some(a => {
+    const u = ideaText(a).trim();
+    return t === u || similarity(t, u) >= IDEA_DUP_THRESHOLD;
+  });
 }
 
 function buildPrompt({ post, analysis, profile, schemaHint, extraNote }) {
@@ -65,15 +76,17 @@ async function requestIdeas(provider, prompt, schemaHint) {
   let raw = null;
   try {
     raw = await provider.generateStructuredOutput(prompt, schemaHint);
-  } catch { raw = null; }
+  } catch (e) { if (e?.fatal) throw e; raw = null; }
   if (!raw) {
     try {
       const textOut = await provider.generateText(prompt);
       raw = safeParseJson(textOut);
-    } catch { raw = null; }
+    } catch (e) { if (e?.fatal) throw e; raw = null; }
   }
   return raw;
 }
+
+export { similarity };
 
 export async function generateIdeas({ post, analysis, profile }) {
   const provider = createAIProvider();
@@ -90,13 +103,10 @@ export async function generateIdeas({ post, analysis, profile }) {
   const validated1 = validateIdeasOutput(raw1);
 
   let acceptedIdeas = [];
-  let seen = new Set();
   if (validated1.ok) {
     for (const idea of validated1.value.ideas) {
       if (isTooSimilar(idea, post.text)) continue;   // コピー類似度NG → 必ず不採用 (fallback復活しない)
-      const fp = ideaFingerprint(idea);
-      if (seen.has(fp)) continue;
-      seen.add(fp);
+      if (isDuplicateIdea(idea, acceptedIdeas)) continue;
       acceptedIdeas.push(idea);
     }
   }
@@ -118,9 +128,7 @@ ${acceptedIdeas.map((i, k) => `${k + 1}. ${i.hook}`).join('\n') || '(なし)'}
     if (validated2.ok) {
       for (const idea of validated2.value.ideas) {
         if (isTooSimilar(idea, post.text)) continue;
-        const fp = ideaFingerprint(idea);
-        if (seen.has(fp)) continue;
-        seen.add(fp);
+        if (isDuplicateIdea(idea, acceptedIdeas)) continue;
         acceptedIdeas.push(idea);
         if (acceptedIdeas.length >= IDEAS_MIN_COUNT) break;
       }

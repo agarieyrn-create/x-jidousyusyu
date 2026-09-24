@@ -40,7 +40,9 @@ DBスキーマ・APIエンドポイントは既に `workspace_id` でスコー�
 | 14 | Settings で X API / AI Provider 接続状態表示 | ✅ |
 | 15 | AIレスポンスのruntime validation + 1回リトライ (要件を満たさない出力はDB保存しない) | ✅ |
 | 16 | 全ID指定APIにworkspace_id所有権チェック | ✅ |
-| 17 | Unit + Integration + Workspace分離テスト | ✅ (35 tests passing) |
+| 17 | Unit + Integration + Workspace分離 + LIVE MODE(fetchモック) + DB移行テスト | ✅ (48 tests passing) |
+| 18 | X投稿の再取得時に公開指標を更新 (UPSERT) / LIVE検索でも期間指定を適用 | ✅ |
+| 19 | アイデアは必ず3案 (コピー類似案・近似重複案は不採用、不足時は1回だけ再生成) | ✅ |
 
 ### 未実装 (将来対応)
 
@@ -167,7 +169,9 @@ Dashboard → Discover → 投稿発見 → AI分析 → 「自分向けに変�
 - `profiles` (発信ジャンル・ターゲット・目的・スタイル・除外テーマ)
 - `research_keywords` (キーワード ON/OFF・AI/user ソース)
 - `watch_accounts` (競合/参考アカウント + タグ)
-- `research_posts` (投稿本体 + Trend Score + 保存フラグ, `UNIQUE(platform, external_post_id)`)
+- `research_posts` (投稿本体 + Trend Score + 保存フラグ, `UNIQUE(workspace_id, platform, external_post_id)`)
+  - 同じX投稿でもworkspaceごとに独立した行を持つ。再取得時は `ON CONFLICT ... DO UPDATE` で公開指標を更新し、`id / is_saved / created_at` は保持
+  - 旧スキーマ `UNIQUE(platform, external_post_id)` のDBは起動時に自動移行 (データ保持)
 - `analyses` (Hook/Structure/CTA/why_it_may_have_worked/reusable_patterns など JSON配列で保持)
 - `ideas` (生成された自分向けアイデア + status/tags)
 
@@ -285,6 +289,7 @@ Cloudflare Workers / Pages に載せる場合の推奨は:
 ---
 
 ## 12. 既知の制約
+- AIサービス (OpenAI) の 401/403/429 は再生成リトライせず、日本語メッセージで即エラーを返す (APIキー・レスポンスbodyは返さない)
 
 - **認証は未実装** (Single User Demo Mode)。マルチユーザー対応は将来対応
 - X API 側のレート制限 / 検索対象範囲 (recent search は直近7日) は API 側の仕様に依存

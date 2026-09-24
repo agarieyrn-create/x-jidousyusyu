@@ -76,7 +76,7 @@ CREATE TABLE IF NOT EXISTS research_posts (
   has_media INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
-  UNIQUE(platform, external_post_id),
+  UNIQUE(workspace_id, platform, external_post_id),
   FOREIGN KEY(workspace_id) REFERENCES workspaces(id)
 );
 

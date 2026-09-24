@@ -185,3 +185,24 @@ test('ideasToJson maps to content brief', () => {
   assert.equal(out[0].idea_id, 'i1');
   assert.deepEqual(out[0].structure, ['a']);
 });
+
+// ---------- Idea near-duplicate / AIProviderError ----------
+import { isDuplicateIdea } from '../src/services/ai/IdeaGenerator.js';
+import { AIProviderError } from '../src/services/ai/AIProvider.js';
+
+test('isDuplicateIdea: near-identical title/hook is duplicate, different idea is not', () => {
+  const a = { title: 'AIを使っているのに残業が減らない人の3つの共通点', hook: '「AIで残業ゼロ」は嘘です。' };
+  const near = { title: 'AIを使っているのに残業が減らない人の3つの共通点とは', hook: '「AIで残業ゼロ」は嘘です!' };
+  const diff = { title: '非エンジニアがエージェントを自作する最初の一歩', hook: '最初にやるべきは業務の紙分解です。' };
+  assert.equal(isDuplicateIdea(near, [a]), true);
+  assert.equal(isDuplicateIdea(diff, [a]), false);
+});
+
+test('AIProviderError: 429/401 are fatal with Japanese message', () => {
+  const e429 = new AIProviderError(429);
+  assert.equal(e429.code, 'rate_limited');
+  assert.equal(e429.fatal, true);
+  assert.match(e429.message, /利用上限/);
+  const e500 = new AIProviderError(503);
+  assert.equal(e500.fatal, false);
+});

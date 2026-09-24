@@ -58,6 +58,7 @@ export async function analyzePost(post) {
   try {
     raw = await provider.generateStructuredOutput(prompt, ANALYSIS_SCHEMA);
   } catch (e) {
+    if (e?.fatal) throw e; // 認証/権限/上限はリトライしても無駄 → 呼び出し側で日本語エラー
     raw = null;
   }
   let validated = validateAnalysisOutput(raw);
@@ -76,7 +77,8 @@ export async function analyzePost(post) {
       const textOut = await provider.generateText(retryPrompt);
       raw2 = safeParseJson(textOut);
     }
-  } catch {
+  } catch (e) {
+    if (e?.fatal) throw e;
     raw2 = null;
   }
   const validated2 = validateAnalysisOutput(raw2);

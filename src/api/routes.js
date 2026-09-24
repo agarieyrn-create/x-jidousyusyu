@@ -17,6 +17,20 @@ import { ideasToCsv } from '../services/export/CsvExporter.js';
 import { ideasToJson, ideaToBrief } from '../services/export/JsonExporter.js';
 import { parseXUrl } from '../services/social/x/XUrlParser.js';
 
+// AIProviderError → HTTP応答。キーやレスポンスbodyは含めない。
+function aiErrorResponse(c, e, fallbackMessage) {
+  if (e && e.name === 'AIProviderError') {
+    const status = e.code === 'rate_limited' ? 429 : 502;
+    return c.json({ error: e.message, error_code: e.code }, status);
+  }
+  return c.json({ error: fallbackMessage }, 500);
+}
+
+async function safeAnalyze(post) {
+  try { return { analysis: await analyzePost(post) }; }
+  catch (e) { return { error: e }; }
+}
+
 export function createApiRoutes({ getWorkspaceId }) {
   const api = new Hono();
 
@@ -319,7 +333,8 @@ export function createApiRoutes({ getWorkspaceId }) {
     const existing = db.prepare('SELECT * FROM analyses WHERE post_id = ?').get(id);
     if (existing) return c.json({ analysis: mapAnalysisRow(existing), cached: true });
 
-    const analysis = await analyzePost(mapDbRowToPost(post));
+    const { analysis, error: aiErr } = await safeAnalyze(mapDbRowToPost(post));
+    if (aiErr) return aiErrorResponse(c, aiErr, 'AI分析に失敗しました。時間をおいて再度お試しください。');
     if (!analysis) return c.json({ error: 'AI分析に失敗しました。時間をおいて再度お試しください。' }, 500);
     const aid = uid('ana');
     const now = nowIso();
@@ -367,7 +382,11 @@ export function createApiRoutes({ getWorkspaceId }) {
     const done = [];
     const failed = [];
     for (const post of rows) {
-      const analysis = await analyzePost(mapDbRowToPost(post));
+      const { analysis, error: aiErr } = await safeAnalyze(mapDbRowToPost(post));
+      if (aiErr?.fatal) {
+        // 上限/認証エラーは残りも失敗するので打ち切る
+        return c.json({ ok: false, analyzed: done.length, post_ids: done, failed: [...failed, post.id], error: aiErr.message, error_code: aiErr.code }, aiErr.code === 'rate_limited' ? 429 : 502);
+      }
       if (!analysis) { failed.push(post.id); continue; }
       const aid = uid('ana');
       db.prepare(`INSERT OR IGNORE INTO analyses
@@ -501,7 +520,9 @@ export function createApiRoutes({ getWorkspaceId }) {
     let analysisRow = db.prepare('SELECT * FROM analyses WHERE post_id = ?').get(postId);
     let analysis = analysisRow ? mapAnalysisRow(analysisRow) : null;
     if (!analysis) {
-      analysis = await analyzePost(mapDbRowToPost(post));
+      const r = await safeAnalyze(mapDbRowToPost(post));
+      if (r.error) return aiErrorResponse(c, r.error, 'AI分析に失敗しました。');
+      analysis = r.analysis;
       if (!analysis) return c.json({ error: 'AI分析に失敗したためアイデア生成もできません。時間をおいて再度お試しください。' }, 500);
     }
     const profileRow = db.prepare('SELECT * FROM profiles WHERE workspace_id = ?').get(wid);
@@ -511,7 +532,12 @@ export function createApiRoutes({ getWorkspaceId }) {
       objectives: jsonArray(profileRow.objectives),
       excluded_topics: jsonArray(profileRow.excluded_topics)
     } : {};
-    const out = await generateIdeas({ post: mapDbRowToPost(post), analysis, profile });
+    let out;
+    try {
+      out = await generateIdeas({ post: mapDbRowToPost(post), analysis, profile });
+    } catch (e) {
+      return aiErrorResponse(c, e, 'アイデア生成に失敗しました');
+    }
     if (!out.ideas || out.ideas.length === 0) {
       // validate 2連続失敗 → DBには入れない
       return c.json({ error: out.error || 'アイデア生成に失敗しました' }, 500);
@@ -683,99 +709,64 @@ function countBy(arr) {
 }
 
 /**
- * research_posts への UPSERT。
- *
- * 既存行 (workspace_id + platform + external_post_id で一致) は
- *   text / username / display_name / like_count / repost_count / reply_count / quote_count
- *   follower_count / trend_score / has_media / source_keyword / updated_at
- * を最新値へ更新する。
- *
- * id / is_saved / created_at は保持する (ユーザーが保存済みマークしていても消えないため)。
- * workspace_id はキーの一部なので当然変わらない。
- *
- * 同一 platform+external_post_id が「別ワークスペース」にも存在する場合、
- * 現在のスキーマは UNIQUE(platform, external_post_id) 制約があるため
- * ワークスペースを跨いで重複を持たない前提。安全のため WHERE に workspace_id も含める。
+ * research_posts への UPSERT (SQLite ON CONFLICT)。
+ * キー: UNIQUE(workspace_id, platform, external_post_id)
+ * 既存行は text / username / display_name / like_count / repost_count / reply_count /
+ *   quote_count / follower_count / trend_score / has_media / source_keyword / updated_at を更新。
+ * id / workspace_id / is_saved / created_at は保持。
+ * 別workspaceの同一投稿は別行として独立に保持される。
  */
 export function upsertPostsBatch({ workspaceId, posts }) {
   const now = nowIso();
-  const findStmt = db.prepare(
-    'SELECT id FROM research_posts WHERE workspace_id = ? AND platform = ? AND external_post_id = ?'
-  );
-  const insertStmt = db.prepare(`INSERT INTO research_posts
+  const stmt = db.prepare(`INSERT INTO research_posts
     (id, workspace_id, platform, external_post_id, author_id, username, display_name,
      text, url, published_at, like_count, repost_count, reply_count, quote_count, follower_count,
      trend_score, source_keyword, is_saved, has_media, created_at, updated_at)
     VALUES (@id, @workspace_id, @platform, @external_post_id, @author_id, @username, @display_name,
             @text, @url, @published_at, @like_count, @repost_count, @reply_count, @quote_count, @follower_count,
-            @trend_score, @source_keyword, 0, @has_media, @created_at, @updated_at)`);
-  const updateStmt = db.prepare(`UPDATE research_posts SET
-      text = @text,
-      username = @username,
-      display_name = @display_name,
-      like_count = @like_count,
-      repost_count = @repost_count,
-      reply_count = @reply_count,
-      quote_count = @quote_count,
-      follower_count = @follower_count,
-      trend_score = @trend_score,
-      has_media = @has_media,
-      source_keyword = @source_keyword,
-      updated_at = @updated_at
-    WHERE workspace_id = @workspace_id AND platform = @platform AND external_post_id = @external_post_id`);
+            @trend_score, @source_keyword, 0, @has_media, @now, @now)
+    ON CONFLICT(workspace_id, platform, external_post_id) DO UPDATE SET
+      text = excluded.text,
+      username = excluded.username,
+      display_name = excluded.display_name,
+      like_count = excluded.like_count,
+      repost_count = excluded.repost_count,
+      reply_count = excluded.reply_count,
+      quote_count = excluded.quote_count,
+      follower_count = excluded.follower_count,
+      trend_score = excluded.trend_score,
+      has_media = excluded.has_media,
+      source_keyword = excluded.source_keyword,
+      updated_at = excluded.updated_at
+    RETURNING id`);
 
   const results = [];
-  const tx = db.transaction(list => {
+  db.transaction(list => {
     for (const p of list) {
-      const platform = p.platform || 'x';
-      const existing = findStmt.get(workspaceId, platform, p.external_post_id);
-      if (existing) {
-        updateStmt.run({
-          workspace_id: workspaceId,
-          platform,
-          external_post_id: p.external_post_id,
-          text: p.text ?? '',
-          username: p.username ?? null,
-          display_name: p.display_name ?? null,
-          like_count: p.like_count || 0,
-          repost_count: p.repost_count || 0,
-          reply_count: p.reply_count || 0,
-          quote_count: p.quote_count || 0,
-          follower_count: p.follower_count ?? 0,
-          trend_score: p.trend_score || 0,
-          has_media: p.has_media ? 1 : 0,
-          source_keyword: p.source_keyword ?? null,
-          updated_at: now
-        });
-        results.push({ id: existing.id, mode: 'updated' });
-      } else {
-        const id = uid('pst');
-        insertStmt.run({
-          id,
-          workspace_id: workspaceId,
-          platform,
-          external_post_id: p.external_post_id,
-          author_id: p.author_id || null,
-          username: p.username || null,
-          display_name: p.display_name || null,
-          text: p.text ?? '',
-          url: p.url || null,
-          published_at: p.published_at || null,
-          like_count: p.like_count || 0,
-          repost_count: p.repost_count || 0,
-          reply_count: p.reply_count || 0,
-          quote_count: p.quote_count || 0,
-          follower_count: p.follower_count ?? 0,
-          trend_score: p.trend_score || 0,
-          source_keyword: p.source_keyword ?? null,
-          has_media: p.has_media ? 1 : 0,
-          created_at: now,
-          updated_at: now
-        });
-        results.push({ id, mode: 'inserted' });
-      }
+      const newId = uid('pst');
+      const r = stmt.get({
+        id: newId,
+        workspace_id: workspaceId,
+        platform: p.platform || 'x',
+        external_post_id: p.external_post_id,
+        author_id: p.author_id || null,
+        username: p.username ?? null,
+        display_name: p.display_name ?? null,
+        text: p.text ?? '',
+        url: p.url || null,
+        published_at: p.published_at || null,
+        like_count: p.like_count || 0,
+        repost_count: p.repost_count || 0,
+        reply_count: p.reply_count || 0,
+        quote_count: p.quote_count || 0,
+        follower_count: p.follower_count ?? 0,
+        trend_score: p.trend_score || 0,
+        source_keyword: p.source_keyword ?? null,
+        has_media: p.has_media ? 1 : 0,
+        now
+      });
+      results.push({ id: r.id, mode: r.id === newId ? 'inserted' : 'updated' });
     }
-  });
-  tx(posts);
+  })(posts);
   return results;
 }

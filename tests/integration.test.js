@@ -276,14 +276,22 @@ test('UPSERT#1: refetching same X post updates metrics but keeps id / is_saved /
   assert.equal(now.created_at, originalCreatedAt);
 });
 
-test('UPSERT#2: same external_post_id in different workspace inserts as new row', () => {
-  // wsBに同じexternal_post_idを入れると、UNIQUE(platform, external_post_id)制約に引っかかる。
-  // 仕様として現状は「同一投稿はどのworkspaceでも1行しか持たない」 (グローバルユニーク) のため、
-  // wsB での upsert は wsA の行と衝突して INSERT に失敗するのが正しい挙動。
-  //  → ここでは「同一WS内のUPSERT」の正しさが担保されていることを再確認する。
-  const rows = db.prepare('SELECT * FROM research_posts WHERE external_post_id = ?').all('upsert_test_001');
-  assert.equal(rows.length, 1, '同一 external_post_id は1行のみ');
-  assert.equal(rows[0].workspace_id, wsA);
+test('UPSERT#2: same external_post_id in another workspace is stored independently', () => {
+  const r = upsertPostsBatch({
+    workspaceId: wsB,
+    posts: [{ platform: 'x', external_post_id: 'upsert_test_001', text: 'wsB側', like_count: 1,
+      published_at: new Date().toISOString() }]
+  });
+  assert.equal(r[0].mode, 'inserted', 'wsBでは新規行');
+  const rows = db.prepare('SELECT * FROM research_posts WHERE external_post_id = ? ORDER BY workspace_id').all('upsert_test_001');
+  assert.equal(rows.length, 2, 'workspaceごとに1行ずつ');
+  const a = rows.find(x => x.workspace_id === wsA);
+  const b = rows.find(x => x.workspace_id === wsB);
+  assert.equal(a.like_count, 500, 'wsAの数値はwsBの取得で上書きされない');
+  assert.equal(a.is_saved, 1);
+  assert.equal(b.like_count, 1);
+  assert.equal(b.is_saved, 0);
+  assert.notEqual(a.id, b.id);
 });
 
 test('DAYS#1: research/search DEMO respects days filter', async () => {
