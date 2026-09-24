@@ -35,6 +35,7 @@ export async function renderWatch(root) {
         tags: (document.getElementById('wa-tags').value || '').split(',').map(s => s.trim()).filter(Boolean)
       });
       toast('登録しました');
+      ['wa-user','wa-name','wa-tags','wa-followers','wa-memo'].forEach(i => { document.getElementById(i).value = ''; });
       await load();
     } catch (e) { toast('登録失敗: ' + e.message); }
   };
@@ -62,16 +63,17 @@ async function load() {
   </tbody></table>`;
   box.querySelectorAll('[data-del]').forEach(el => el.onclick = async () => {
     if (!confirm('削除しますか?')) return;
-    await api.deleteWatchAccount(el.dataset.del);
-    toast('削除しました');
-    load();
+    try { await api.deleteWatchAccount(el.dataset.del); toast('削除しました'); load(); }
+    catch (e) { toast('削除失敗: ' + e.message); }
   });
   box.querySelectorAll('[data-analyze]').forEach(el => el.onclick = () => renderAnalysis(el.dataset.analyze));
 }
 
 async function renderAnalysis(id) {
   const panel = openDrawer('<div>アカウント分析を集計中…</div>');
-  const r = await api.getWatchAnalysis(id);
+  let r;
+  try { r = await api.getWatchAnalysis(id); }
+  catch (e) { panel.innerHTML = `<button class="close" data-close>×</button><div class="hint">分析に失敗しました: ${escapeHtml(e.message)}</div>`; return; }
   if (!r.stats) {
     panel.innerHTML = `<button class="close" data-close>×</button>
       <h2>@${escapeHtml(r.account.username)}</h2>

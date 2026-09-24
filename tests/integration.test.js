@@ -208,7 +208,7 @@ test('WS-ISO#10: other workspace analysis endpoint → 404 for wsA account', asy
 // ---------------- UPSERT & days filter ----------------
 const { upsertPostsBatch } = await import('../src/api/routes.js');
 
-test('UPSERT#1: refetching same X post updates metrics but keeps id / is_saved / created_at', () => {
+test('UPSERT#1: refetching same X post updates metrics but keeps id / is_saved / created_at', async () => {
   // 1回目: 挿入
   const before = upsertPostsBatch({
     workspaceId: wsA,
@@ -235,6 +235,7 @@ test('UPSERT#1: refetching same X post updates metrics but keeps id / is_saved /
   const originalCreatedAt = inserted.created_at;
 
   // 2回目: 同じ external_post_id で数値だけ増えて再取得された想定
+  await new Promise(r => setTimeout(r, 5)); // 同一ミリ秒でupdated_atが同値になるのを防ぐ
   const after = upsertPostsBatch({
     workspaceId: wsA,
     posts: [{

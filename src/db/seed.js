@@ -100,5 +100,32 @@ export function seed() {
     }
   }
 
+  refreshDemoPostDates(workspaceId);
   return { userId, workspaceId };
+}
+
+// DEMO用モック投稿 (external_post_id が demo_ で始まるもの) の published_at を
+// 起動のたびに「現在時刻からの相対時間」へ戻す。
+// これをしないと、DBを作ってから数日経つとモックが期間外になり DEMO検索が0件になる。
+// ユーザーの保存フラグ・分析・アイデアはそのまま残る。
+export function refreshDemoPostDates(workspaceId) {
+  const upd = db.prepare(`UPDATE research_posts SET published_at = ?
+    WHERE workspace_id = ? AND platform = 'x' AND external_post_id = ?`);
+  const byId = new Map(MOCK_POSTS.map(p => [p.external_post_id, p]));
+  const rows = db.prepare(`SELECT id, external_post_id, like_count, repost_count, reply_count, quote_count, follower_count, published_at
+    FROM research_posts WHERE workspace_id = ? AND external_post_id LIKE 'demo\_%' ESCAPE '\\'`).all(workspaceId);
+  if (rows.length === 0) return 0;
+  const tx = db.transaction(() => {
+    for (const r of rows) {
+      const m = byId.get(r.external_post_id);
+      if (m) upd.run(m.published_at, workspaceId, r.external_post_id);
+    }
+    // 日時が変わったのでスコアも再計算
+    const fresh = db.prepare(`SELECT * FROM research_posts WHERE workspace_id = ? AND external_post_id LIKE 'demo\_%' ESCAPE '\\'`).all(workspaceId);
+    const scored = computeTrendScoreBatch(fresh);
+    const us = db.prepare('UPDATE research_posts SET trend_score = ? WHERE id = ?');
+    for (const p of scored) us.run(p.trend_score, p.id);
+  });
+  tx();
+  return rows.length;
 }

@@ -38,13 +38,14 @@ async function load() {
   list.innerHTML = r.ideas.map(ideaCard).join('');
   list.querySelectorAll('[data-status-sel]').forEach(el => {
     el.onchange = async () => {
-      await api.updateIdea(el.dataset.statusSel, { status: el.value });
-      toast('ステータスを更新しました');
+      try { await api.updateIdea(el.dataset.statusSel, { status: el.value }); toast('ステータスを更新しました'); }
+      catch (e) { toast('更新失敗: ' + e.message); }
     };
   });
   list.querySelectorAll('[data-copy-brief]').forEach(el => {
     el.onclick = async () => {
-      const b = await api.getBrief(el.dataset.copyBrief);
+      let b;
+      try { b = await api.getBrief(el.dataset.copyBrief); } catch (e) { toast('取得失敗: ' + e.message); return; }
       const txt = `# Content Brief\n${JSON.stringify(b, null, 2)}`;
       try { await navigator.clipboard.writeText(txt); toast('プロンプト用JSONをコピーしました'); }
       catch { toast('コピーに失敗しました。手動で選択してください'); }
@@ -52,7 +53,8 @@ async function load() {
   });
   list.querySelectorAll('[data-view-brief]').forEach(el => {
     el.onclick = async () => {
-      const b = await api.getBrief(el.dataset.viewBrief);
+      let b;
+      try { b = await api.getBrief(el.dataset.viewBrief); } catch (e) { toast('取得失敗: ' + e.message); return; }
       const pre = document.getElementById(`brief-${el.dataset.viewBrief}`);
       pre.textContent = JSON.stringify(b, null, 2);
       pre.classList.toggle('hidden');

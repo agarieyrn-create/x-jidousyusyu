@@ -31,8 +31,50 @@ async function safeAnalyze(post) {
   catch (e) { return { error: e }; }
 }
 
+// ---- 入力正規化 helpers ----
+class BadRequest extends Error { constructor(m) { super(m); this.name = 'BadRequest'; } }
+async function readJson(c) {
+  try {
+    const b = await c.req.json();
+    if (b === null || typeof b !== 'object' || Array.isArray(b)) throw new Error();
+    return b;
+  } catch {
+    throw new BadRequest('リクエストの形式が不正です (JSONオブジェクトを送ってください)');
+  }
+}
+function toStrList(v) {
+  if (v === undefined || v === null || v === '') return [];
+  const arr = Array.isArray(v) ? v : String(v).split(/[\n,]/);
+  return arr.map(x => String(x ?? '').trim()).filter(Boolean);
+}
+function toInt(v, def, min, max) {
+  const n = Math.floor(Number(v));
+  if (!Number.isFinite(n)) return def;
+  return Math.min(max, Math.max(min, n));
+}
+function toBool(v, def) {
+  if (v === undefined || v === null) return def;
+  if (typeof v === 'string') return !['false', '0', ''].includes(v.toLowerCase());
+  return !!v;
+}
+// http/https 以外 (javascript: 等) のURLは保存しない
+function safeHttpUrl(v) {
+  if (!v) return null;
+  try {
+    const u = new URL(String(v).trim());
+    return (u.protocol === 'http:' || u.protocol === 'https:') ? u.toString() : null;
+  } catch { return null; }
+}
+
 export function createApiRoutes({ getWorkspaceId }) {
   const api = new Hono();
+
+  // 共通エラーハンドラ: 内部エラーの詳細はクライアントに返さない
+  api.onError((err, c) => {
+    if (err instanceof BadRequest) return c.json({ error: err.message }, 400);
+    console.error('[api error]', c.req.method, c.req.path, err?.message);
+    return c.json({ error: 'サーバー内部でエラーが発生しました。時間をおいて再度お試しください。' }, 500);
+  });
 
   // ---------- 所有権 helper ----------
   // それぞれ「id と workspace_id が一致した行」だけを返す。
@@ -76,7 +118,7 @@ export function createApiRoutes({ getWorkspaceId }) {
 
   api.put('/profile', async c => {
     const wid = getWorkspaceId(c);
-    const body = await c.req.json();
+    const body = await readJson(c);
     const existing = db.prepare('SELECT id FROM profiles WHERE workspace_id = ?').get(wid);
     const now = nowIso();
     if (existing) {
@@ -115,7 +157,7 @@ export function createApiRoutes({ getWorkspaceId }) {
 
   api.post('/keywords', async c => {
     const wid = getWorkspaceId(c);
-    const body = await c.req.json();
+    const body = await readJson(c);
     if (body.regenerate) {
       const profile = db.prepare('SELECT * FROM profiles WHERE workspace_id = ?').get(wid);
       const gen = await generateKeywords({
@@ -126,18 +168,22 @@ export function createApiRoutes({ getWorkspaceId }) {
       return c.json({ suggestions: gen.keywords, source: gen.source });
     }
     const now = nowIso();
-    const list = Array.isArray(body.keywords) ? body.keywords : (body.keyword ? [body.keyword] : []);
+    const list = [...new Set(toStrList(body.keywords !== undefined ? body.keywords : body.keyword).map(k => k.slice(0, 100)))];
+    if (list.length === 0) throw new BadRequest('キーワードを入力してください');
+    const existing = new Set(db.prepare('SELECT keyword FROM research_keywords WHERE workspace_id = ?').all(wid).map(r => r.keyword));
     const inserted = [];
+    const skipped = [];
     for (const k of list) {
-      if (!k) continue;
+      if (existing.has(k)) { skipped.push(k); continue; }
+      existing.add(k);
       const id = uid('kw');
       try {
         db.prepare('INSERT INTO research_keywords (id, workspace_id, keyword, is_active, source, created_at) VALUES (?, ?, ?, 1, ?, ?)')
           .run(id, wid, k, body.source || 'user', now);
         inserted.push({ id, keyword: k });
-      } catch (e) { /* ignore duplicate */ }
+      } catch (e) { skipped.push(k); }
     }
-    return c.json({ ok: true, inserted });
+    return c.json({ ok: true, inserted, skipped });
   });
 
   api.put('/keywords/:id', async c => {
@@ -146,10 +192,14 @@ export function createApiRoutes({ getWorkspaceId }) {
     const target = findKeywordOwned(id, wid);
     if (!target) return c.json({ error: 'not_found' }, 404);
 
-    const body = await c.req.json();
+    const body = await readJson(c);
     const fields = [];
     const vals = [];
-    if (body.keyword !== undefined) { fields.push('keyword = ?'); vals.push(body.keyword); }
+    if (body.keyword !== undefined) {
+      const kw = String(body.keyword ?? '').trim().slice(0, 100);
+      if (!kw) throw new BadRequest('キーワードを入力してください');
+      fields.push('keyword = ?'); vals.push(kw);
+    }
     if (body.is_active !== undefined) { fields.push('is_active = ?'); vals.push(body.is_active ? 1 : 0); }
     if (fields.length === 0) return c.json({ ok: true });
     vals.push(id, wid);
@@ -168,12 +218,17 @@ export function createApiRoutes({ getWorkspaceId }) {
   // ---------- research search ----------
   api.post('/research/search', async c => {
     const wid = getWorkspaceId(c);
-    const body = await c.req.json();
-    const {
-      keywords = [], days = 7, minLikes = 0, minReposts = 0,
-      language = 'ja', excludeReposts = true, excludeReplies = false,
-      excludeKeywords = [], fromUsername
-    } = body;
+    const body = await readJson(c);
+    const keywords = toStrList(body.keywords).slice(0, 5);
+    const days = toInt(body.days, 7, 1, 30);           // X Recent Searchは直近7日だがDEMOは30日まで許容
+    const minLikes = toInt(body.minLikes, 0, 0, 1e9);
+    const minReposts = toInt(body.minReposts, 0, 0, 1e9);
+    const language = ['ja', 'en'].includes(body.language) ? body.language : 'ja';
+    const excludeReposts = toBool(body.excludeReposts, true);
+    const excludeReplies = toBool(body.excludeReplies, false);
+    const excludeKeywords = toStrList(body.excludeKeywords);
+    const fromUsername = typeof body.fromUsername === 'string' && body.fromUsername.trim()
+      ? body.fromUsername.trim().replace(/^@/, '') : undefined;
 
     const status = [];
     const x = new XAdapter();
@@ -425,13 +480,17 @@ export function createApiRoutes({ getWorkspaceId }) {
 
   api.post('/watch-accounts', async c => {
     const wid = getWorkspaceId(c);
-    const body = await c.req.json();
+    const body = await readJson(c);
+    const username = String(body.username ?? '').trim().replace(/^@/, '');
+    if (!/^[A-Za-z0-9_]{1,15}$/.test(username)) throw new BadRequest('usernameは英数字と_の1〜15文字で入力してください');
+    const dup = db.prepare('SELECT id FROM watch_accounts WHERE workspace_id = ? AND platform = ? AND lower(username) = lower(?)').get(wid, body.platform || 'x', username);
+    if (dup) return c.json({ error: 'このアカウントは既に登録されています' }, 409);
     const id = uid('wa');
     db.prepare(`INSERT INTO watch_accounts
       (id, workspace_id, platform, username, display_name, external_user_id, followers, tags, memo, created_at)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
       id, wid, body.platform || 'x',
-      (body.username || '').replace(/^@/, ''),
+      username,
       body.display_name || null, body.external_user_id || null,
       Number(body.followers) || 0,
       toJson(body.tags || []), body.memo || null, nowIso()
@@ -477,12 +536,14 @@ export function createApiRoutes({ getWorkspaceId }) {
   // ---------- manual import ----------
   api.post('/manual-import', async c => {
     const wid = getWorkspaceId(c);
-    const body = await c.req.json();
+    const body = await readJson(c);
     const adapter = new ManualAdapter();
     let normalized;
     if (body.type === 'url') {
+      if (!safeHttpUrl(body.url)) throw new BadRequest('http(s)で始まる投稿URLを入力してください');
       normalized = await adapter.importFromUrl({ url: body.url, memo: body.memo, tags: body.tags });
     } else {
+      if (!String(body.text ?? '').trim()) throw new BadRequest('本文を入力してください');
       normalized = adapter.importFromText({
         text: body.text, url: body.url, username: body.username,
         platform: body.platform, memo: body.memo, tags: body.tags
@@ -499,13 +560,14 @@ export function createApiRoutes({ getWorkspaceId }) {
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)`).run(
         id, wid, scored.platform || 'manual', scored.external_post_id, scored.author_id || null,
         scored.username || null, scored.display_name || null, scored.text || '',
-        scored.url || null, scored.published_at,
+        safeHttpUrl(scored.url), scored.published_at,
         scored.like_count || 0, scored.repost_count || 0, scored.reply_count || 0, scored.quote_count || 0,
         scored.follower_count || 0, scored.trend_score || 0, null,
         scored.has_media ? 1 : 0, now, now
       );
     } catch (e) {
-      return c.json({ error: '重複投稿またはDBエラー', detail: String(e.message) }, 409);
+      if (String(e?.code || '').startsWith('SQLITE_CONSTRAINT')) return c.json({ error: 'この投稿は既に登録されています' }, 409);
+      throw e;
     }
     return c.json({ ok: true, id });
   });
@@ -513,8 +575,9 @@ export function createApiRoutes({ getWorkspaceId }) {
   // ---------- ideas ----------
   api.post('/ideas/generate', async c => {
     const wid = getWorkspaceId(c);
-    const body = await c.req.json();
-    const postId = body.post_id;
+    const body = await readJson(c);
+    const postId = typeof body.post_id === 'string' ? body.post_id : '';
+    if (!postId) throw new BadRequest('post_id を指定してください');
     const post = findPostOwned(postId, wid);
     if (!post) return c.json({ error: 'not_found' }, 404);
     let analysisRow = db.prepare('SELECT * FROM analyses WHERE post_id = ?').get(postId);
@@ -581,8 +644,10 @@ export function createApiRoutes({ getWorkspaceId }) {
     const cur = findIdeaOwned(id, wid);
     if (!cur) return c.json({ error: 'not_found' }, 404);
 
-    const body = await c.req.json();
+    const body = await readJson(c);
     const next = { ...cur };
+    const STATUSES = ['Inbox','採用候補','採用','作成中','投稿済み','保留'];
+    if (body.status !== undefined && !STATUSES.includes(body.status)) throw new BadRequest('不正なステータスです');
     for (const k of ['title','objective','target','hook','angle','status','platform']) {
       if (body[k] !== undefined) next[k] = body[k];
     }

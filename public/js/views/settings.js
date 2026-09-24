@@ -79,10 +79,12 @@ export async function renderSettings(root) {
   document.getElementById('kw-add').onclick = async () => {
     const v = document.getElementById('kw-input').value.trim();
     if (!v) return;
-    await api.addKeywords([v]);
-    document.getElementById('kw-input').value = '';
-    const list = (await api.getKeywords()).keywords;
-    renderKeywords(list);
+    try {
+      const r = await api.addKeywords([v]);
+      if (r.skipped?.length) toast('既に登録済みのキーワードです');
+      document.getElementById('kw-input').value = '';
+      renderKeywords((await api.getKeywords()).keywords);
+    } catch (e) { toast('追加失敗: ' + e.message); }
   };
 
   document.getElementById('kw-regen').onclick = async () => {
@@ -102,8 +104,10 @@ export async function renderSettings(root) {
       document.getElementById('kw-add-sg').onclick = async () => {
         const picks = [...box.querySelectorAll('input[type=checkbox]:checked')].map(el => el.dataset.sg);
         if (!picks.length) return;
-        await api.addKeywords(picks, 'ai');
-        toast(`${picks.length}件を追加しました`);
+        let r;
+        try { r = await api.addKeywords(picks, 'ai'); }
+        catch (e) { toast('追加失敗: ' + e.message); return; }
+        toast(`${r.inserted.length}件を追加しました` + (r.skipped?.length ? ` (${r.skipped.length}件は登録済み)` : ''));
         box.classList.add('hidden');
         const list = (await api.getKeywords()).keywords;
         renderKeywords(list);
@@ -126,11 +130,13 @@ function renderKeywords(kws) {
     </tr>`).join('')}
   </tbody></table>`;
   box.querySelectorAll('[data-toggle]').forEach(el => el.onchange = async () => {
-    await api.updateKeyword(el.dataset.toggle, { is_active: el.checked });
+    try { await api.updateKeyword(el.dataset.toggle, { is_active: el.checked }); }
+    catch (e) { el.checked = !el.checked; toast('更新失敗: ' + e.message); }
   });
   box.querySelectorAll('[data-del]').forEach(el => el.onclick = async () => {
-    await api.deleteKeyword(el.dataset.del);
-    const kws = (await api.getKeywords()).keywords;
-    renderKeywords(kws);
+    try {
+      await api.deleteKeyword(el.dataset.del);
+      renderKeywords((await api.getKeywords()).keywords);
+    } catch (e) { toast('削除失敗: ' + e.message); }
   });
 }

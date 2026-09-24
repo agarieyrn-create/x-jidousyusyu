@@ -1,16 +1,22 @@
 import { api } from '../api.js';
-import { openDrawer, escapeHtml, fmtNum, relativeTime, toast, closeDrawer } from '../app.js';
+import { openDrawer, escapeHtml, fmtNum, relativeTime, toast, closeDrawer, safeUrl } from '../app.js';
 
 export async function renderPostDrawer(postId) {
   const panel = openDrawer('<div>読み込み中…</div>');
-  const { post, analysis } = await api.getPost(postId);
+  let post, analysis;
+  try {
+    ({ post, analysis } = await api.getPost(postId));
+  } catch (e) {
+    panel.innerHTML = `<button class="close" data-close>×</button><div class="hint">投稿を読み込めませんでした: ${escapeHtml(e.message)}</div>`;
+    return;
+  }
   panel.innerHTML = `
     <button class="close" data-close>×</button>
     <div class="drawer-sections">
       <div>
         <h2>元投稿</h2>
         <div class="post-user"><b>${escapeHtml(post.display_name || post.username || '?')}</b> @${escapeHtml(post.username || '?')}</div>
-        <div class="hint">${relativeTime(post.published_at)} · <a href="${post.url}" target="_blank" rel="noopener">元投稿を開く ↗</a></div>
+        <div class="hint">${relativeTime(post.published_at)} · ${post.url ? `<a href="${escapeHtml(safeUrl(post.url))}" target="_blank" rel="noopener noreferrer">元投稿を開く ↗</a>` : '元URLなし'}</div>
         <div class="post-text" style="margin-top:12px;white-space:pre-wrap;font-size:14px;line-height:1.6">${escapeHtml(post.text || '')}</div>
         <div class="post-metrics" style="margin-top:12px">
           <span><b>${fmtNum(post.like_count)}</b>いいね</span>
@@ -38,9 +44,11 @@ export async function renderPostDrawer(postId) {
 
   document.getElementById('btn-save').onclick = async () => {
     const newSaved = !post.is_saved;
-    await api.savePost(postId, newSaved);
-    toast(newSaved ? '保存しました' : '保存を解除しました');
-    renderPostDrawer(postId);
+    try {
+      await api.savePost(postId, newSaved);
+      toast(newSaved ? '保存しました' : '保存を解除しました');
+      renderPostDrawer(postId);
+    } catch (e) { toast('保存に失敗しました: ' + e.message); }
   };
   document.getElementById('btn-analyze').onclick = async () => {
     const statusEl = document.getElementById('post-status');

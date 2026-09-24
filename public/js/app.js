@@ -79,6 +79,13 @@ export function closeDrawer() { document.getElementById('drawer').classList.add(
 export function escapeHtml(s) {
   return String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 }
+// href に入れてよいURLだけ返す (javascript: 等は '#')
+export function safeUrl(u) {
+  try {
+    const x = new URL(String(u || ''), location.origin);
+    return (x.protocol === 'http:' || x.protocol === 'https:') ? x.href : '#';
+  } catch { return '#'; }
+}
 export function fmtNum(n) {
   if (n === null || n === undefined) return '-';
   n = Number(n);

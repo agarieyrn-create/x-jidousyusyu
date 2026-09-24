@@ -45,7 +45,7 @@ export async function renderDashboard(root) {
     rs.innerHTML = data.recent_saved.map(p => `
       <div class="post-card" data-id="${p.id}" style="margin-bottom:10px">
         <div class="post-head"><span class="post-user"><b>@${escapeHtml(p.username || '?')}</b> · ${relativeTime(p.published_at)}</span>
-        <span class="trend">Trend ${p.trend_score.toFixed(1)}</span></div>
+        <span class="trend">Trend ${Number(p.trend_score || 0).toFixed(1)}</span></div>
         <div class="post-text">${escapeHtml((p.text || '').slice(0, 120))}${(p.text||'').length > 120 ? '…' : ''}</div>
       </div>`).join('');
     rs.querySelectorAll('.post-card').forEach(el => el.addEventListener('click', () => renderPostDrawer(el.dataset.id)));

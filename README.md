@@ -40,7 +40,7 @@ DBスキーマ・APIエンドポイントは既に `workspace_id` でスコー�
 | 14 | Settings で X API / AI Provider 接続状態表示 | ✅ |
 | 15 | AIレスポンスのruntime validation + 1回リトライ (要件を満たさない出力はDB保存しない) | ✅ |
 | 16 | 全ID指定APIにworkspace_id所有権チェック | ✅ |
-| 17 | Unit + Integration + Workspace分離 + LIVE MODE(fetchモック) + DB移行テスト | ✅ (48 tests passing) |
+| 17 | Unit + Integration + Workspace分離 + LIVE MODE(fetchモック) + DB移行テスト + レビュー回帰テスト | ✅ (56 tests passing) |
 | 18 | X投稿の再取得時に公開指標を更新 (UPSERT) / LIVE検索でも期間指定を適用 | ✅ |
 | 19 | アイデアは必ず3案 (コピー類似案・近似重複案は不採用、不足時は1回だけ再生成) | ✅ |
 
@@ -289,6 +289,8 @@ Cloudflare Workers / Pages に載せる場合の推奨は:
 ---
 
 ## 12. 既知の制約
+- X API Recent Search の取得範囲は直近7日。Discover の期間は30日まで指定できるが、LIVE MODEでは実質7日まで
+- DEMO用モック投稿 (`demo_` で始まるID) の投稿日時は起動のたびに現在時刻基準へ更新される (保存・分析・アイデアは保持)
 - AIサービス (OpenAI) の 401/403/429 は再生成リトライせず、日本語メッセージで即エラーを返す (APIキー・レスポンスbodyは返さない)
 
 - **認証は未実装** (Single User Demo Mode)。マルチユーザー対応は将来対応
